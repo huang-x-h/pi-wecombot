@@ -336,6 +336,26 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("wecombot-enable", {
+    description: "开启机器人",
+    handler: async (_args, ctx) => {
+      cfg.enabled = true;
+      await save(cfg);
+      if (cfg.botId && cfg.secret) await connect(ctx);
+      ctx.ui.notify("✅ 机器人已开启", "success");
+    },
+  });
+
+  pi.registerCommand("wecombot-disable", {
+    description: "关闭机器人",
+    handler: async (_args, ctx) => {
+      disconnect();
+      cfg.enabled = false;
+      await save(cfg);
+      ctx.ui.notify("✅ 机器人已关闭", "success");
+    },
+  });
+
   pi.registerCommand("wecombot-sessions", {
     description: "查看所有会话",
     handler: async (_args, ctx) => {
