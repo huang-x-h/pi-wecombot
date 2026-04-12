@@ -203,7 +203,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[wecom-bot] [${userName}] 进入会话`);
       
       // 发送欢迎语
-      const reqId = frame.req_id || generateReqId("enter");
+      const reqId = frame.headers?.req_id || generateReqId("enter");
       ws.replyWelcome(frame, {
         msgtype: "text",
         text: {
@@ -404,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 
     if (targetSession) {
       // 回复到对应用户
-      replyTo(targetSession.frame.req_id, replyContent, true);
+      replyTo(targetSession.frame.headers.req_id, replyContent, true);
       console.log(`[wecom-bot] 回复 [${userTag}]: ${replyContent.slice(0, 30)}`);
     } else {
       console.log(`[wecom-bot] 未找到会话: ${userTag}`);
