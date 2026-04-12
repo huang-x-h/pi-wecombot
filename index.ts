@@ -2,7 +2,7 @@
  * pi-wecombot
  * 
  * 企业微信智能机器人 WebSocket 长连接扩展 for pi
- * 支持多个机器人配置和切换
+ * 支持多个机器人配置和快速切换
  * 
  * 参考: https://developer.work.weixin.qq.com/document/path/101463
  */
@@ -53,18 +53,6 @@ const PROMPT = `
 // Utils
 // ============================================================================
 
-function ext(name: string): string {
-  const e = name.split(".").pop()?.toLowerCase() || "";
-  const map: Record<string, string> = {
-    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
-    gif: "image/gif", webp: "image/webp", mp4: "video/mp4",
-    mp3: "audio/mpeg", pdf: "application/pdf", txt: "text/plain",
-  };
-  return map[e] || "application/octet-stream";
-}
-
-function isImg(m: string): boolean { return m.startsWith("image/"); }
-
 async function load(): Promise<Config> {
   try {
     const data = JSON.parse(await readFile(CONFIG, "utf8"));
@@ -80,6 +68,10 @@ async function save(c: Config) {
 
 function getActiveBot(cfg: Config): BotConfig | undefined {
   return cfg.bots.find(b => b.botId === cfg.activeBotId) || cfg.bots[0];
+}
+
+function getBotById(cfg: Config, botId: string): BotConfig | undefined {
+  return cfg.bots.find(b => b.botId === botId);
 }
 
 // ============================================================================
@@ -109,9 +101,14 @@ export default function (pi: ExtensionAPI) {
     const t = ctx.ui.theme;
     const tag = t.fg("accent", "🤖");
     const active = getActiveBot(cfg);
-    if (msg) ctx.ui.setStatus("wecombot", `${tag} ${t.fg("error", msg)}`);
-    else if (!active) ctx.ui.setStatus("wecombot", `${tag} ${t.fg("muted", "未配置")}`);
-    else ctx.ui.setStatus("wecombot", `${tag} ${t.fg(connected ? "success" : "warning", connected ? `✅ (${sessions.size})` : "⚡")} ${active.name || active.botId.slice(0, 8)}`);
+    
+    if (msg) {
+      ctx.ui.setStatus("wecombot", `${tag} ${t.fg("error", msg)}`);
+    } else if (!active) {
+      ctx.ui.setStatus("wecombot", `${tag} ${t.fg("muted", "未配置")}`);
+    } else {
+      ctx.ui.setStatus("wecombot", `${tag} ${t.fg(connected ? "success" : "warning", connected ? `✅ (${sessions.size})` : "⚡")} ${active.name || active.botId.slice(0, 8)}`);
+    }
   }
 
   // 回复
@@ -122,24 +119,22 @@ export default function (pi: ExtensionAPI) {
     ws.replyStream(session.frame, session.streamId, content, isEnd);
   }
 
-  // Connect
-  async function connect(ctx: ExtensionContext, bot?: BotConfig) {
-    const target = bot || getActiveBot(cfg);
-    if (!target) return;
+  // 连接
+  async function connect(ctx: ExtensionContext, bot: BotConfig) {
     disconnect();
 
-    console.log(`[wecombot] 连接中: ${target.name || target.botId}`);
+    console.log(`[wecombot] 连接中: ${bot.name || bot.botId}`);
 
-    ws = new WSClient({ botId: target.botId, secret: target.secret });
+    ws = new WSClient({ botId: bot.botId, secret: bot.secret });
 
     ws.on("connected", () => {
-      console.log("[wecombot] ✅ 已连接");
+      console.log(`[wecombot] ✅ ${bot.name || bot.botId} 已连接`);
       connected = true;
       setStatus(ctx);
     });
 
     ws.on("authenticated", () => {
-      console.log("[wecombot] ✅ 认证成功");
+      console.log(`[wecombot] ✅ ${bot.name || bot.botId} 认证成功`);
       connected = true;
       setStatus(ctx);
     });
@@ -151,15 +146,16 @@ export default function (pi: ExtensionAPI) {
       const reqId = frame.headers?.req_id || generateReqId("msg");
       const userId = frame.body?.from?.userid || "unknown";
       const chatId = frame.body?.chatid || "";
-      const botId = target.botId;
+      const botId = bot.botId;
+      const botName = bot.name;
 
-      console.log(`[wecombot] [${userId}] ${content.slice(0, 30)}`);
+      console.log(`[wecombot] [${botName || botId}] [${userId}] ${content.slice(0, 30)}`);
 
       sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId });
       lastReqId = reqId;
 
       replyTo(reqId, "🤔 思考中...", false);
-      pi.sendUserMessage([{ type: "text", text: `[wecombot] [${userId}]\n${content}` }]);
+      pi.sendUserMessage([{ type: "text", text: `[wecombot] [${botName || botId}] [${userId}]\n${content}` }]);
     });
 
     ws.on("message.image", (frame: any) => {
@@ -167,26 +163,24 @@ export default function (pi: ExtensionAPI) {
       const reqId = frame.headers?.req_id || generateReqId("msg");
       if (url) {
         const userId = frame.body?.from?.userid || "unknown";
-        const botId = target.botId;
-        sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId });
-        pi.sendUserMessage([{ type: "text", text: `[wecombot] [${userId}] 发送了图片: ${url}` }]);
+        sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId });
+        pi.sendUserMessage([{ type: "text", text: `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}` }]);
       }
     });
 
     ws.on("event.enter_chat", (frame: any) => {
-      const reqId = frame.headers?.req_id || generateReqId("enter");
-      ws.replyWelcome(frame, { msgtype: "text", text: { content: `👋 你好！我是 AI 助手，有什么可以帮你的吗？` } });
+      ws.replyWelcome(frame, { msgtype: "text", text: { content: `👋 你好！我是 ${bot.name || "AI"} 助手，有什么可以帮你的吗？` } });
     });
 
     ws.on("disconnected", () => {
-      console.log("[wecombot] ❌ 断开");
+      console.log(`[wecombot] ❌ ${bot.name || bot.botId} 断开`);
       connected = false;
       sessions.clear();
       setStatus(ctx);
     });
 
     ws.on("error", (err) => {
-      console.log("[wecombot] ❌", err);
+      console.log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
       connected = false;
       setStatus(ctx, String(err));
     });
@@ -213,10 +207,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, p) {
       if (!ws || !connected) throw new Error("机器人未连接");
-      const files: string[] = [];
-      for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
       const reqId = sessions.keys().next().value;
       if (!reqId) throw new Error("无活跃会话");
+      const files: string[] = [];
+      for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
       for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
       return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
     },
@@ -258,7 +252,10 @@ export default function (pi: ExtensionAPI) {
       cfg.enabled = true;
       await save(cfg);
       ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}`, "success");
-      await connect(ctx);
+      
+      // 自动连接新添加的机器人
+      const newBot = cfg.bots[cfg.bots.length - 1];
+      await connect(ctx, newBot);
     },
   });
 
@@ -269,9 +266,11 @@ export default function (pi: ExtensionAPI) {
       if (cfg.bots.length === 0) {
         ctx.ui.notify("暂无配置的机器人", "info");
       } else {
-        const list = cfg.bots.map(b => 
-          `${b.botId === cfg.activeBotId ? "▶" : "○"} ${b.name || b.botId.slice(0, 12)}...`
-        ).join("\n");
+        const list = cfg.bots.map(b => {
+          const isActive = b.botId === cfg.activeBotId ? "▶" : "○";
+          const isConnected = connected && b.botId === cfg.activeBotId ? "✅" : "";
+          return `${isActive} ${isConnected} ${b.name || b.botId}`;
+        }).join("\n");
         ctx.ui.notify(`机器人列表:\n${list}`, "info");
       }
     },
@@ -285,10 +284,27 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("暂无配置的机器人", "warning");
         return;
       }
-      const name = await ctx.ui.input("选择机器人(BotID)", cfg.activeBotId || "");
-      if (!name) return;
       
-      const bot = cfg.bots.find(b => b.botId === name || b.name === name);
+      const options = cfg.bots.map(b => 
+        `${b.botId === cfg.activeBotId ? "▶ " : "○ "}${b.name || b.botId}`
+      );
+      
+      // 如果只有一个机器人，直接使用
+      if (options.length === 1) {
+        const bot = cfg.bots[0];
+        cfg.activeBotId = bot.botId;
+        cfg.enabled = true;
+        await save(cfg);
+        ctx.ui.notify(`✅ 已切换到 ${bot.name || bot.botId}`, "success");
+        await connect(ctx, bot);
+        return;
+      }
+      
+      const selected = await ctx.ui.select("选择机器人", options);
+      if (!selected) return;
+      
+      const selectedLabel = selected.replace(/^[▶○] /, "");
+      const bot = cfg.bots.find(b => b.botId === selectedLabel || (b.name || b.botId) === selectedLabel);
       if (!bot) {
         ctx.ui.notify("❌ 机器人不存在", "error");
         return;
@@ -297,7 +313,7 @@ export default function (pi: ExtensionAPI) {
       cfg.activeBotId = bot.botId;
       cfg.enabled = true;
       await save(cfg);
-      ctx.ui.notify(`✅ 已切换到 ${bot.name || bot.botId.slice(0, 8)}`, "success");
+      ctx.ui.notify(`✅ 已切换到 ${bot.name || bot.botId}`, "success");
       await connect(ctx, bot);
     },
   });
@@ -310,7 +326,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("暂无配置的机器人", "warning");
         return;
       }
-      const name = await ctx.ui.input("输入要删除的BotID", "");
+      const name = await ctx.ui.input("输入要删除的BotID或名称", "");
       if (!name) return;
 
       const idx = cfg.bots.findIndex(b => b.botId === name || b.name === name);
@@ -324,9 +340,16 @@ export default function (pi: ExtensionAPI) {
         cfg.activeBotId = cfg.bots[0]?.botId;
       }
       await save(cfg);
-      ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId.slice(0, 8)}`, "success");
-      if (cfg.bots.length > 0) await connect(ctx);
-      else disconnect();
+      ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}`, "success");
+      
+      // 如果删除的是当前连接的机器人，切换到下一个
+      if (removed.botId !== cfg.activeBotId) {
+        // 需要重连
+      } else if (cfg.bots.length > 0) {
+        await connect(ctx, cfg.bots[0]);
+      } else {
+        disconnect();
+      }
     },
   });
 
@@ -336,38 +359,23 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const active = getActiveBot(cfg);
       if (!active) ctx.ui.notify("❌ 未配置", "warning");
-      else ctx.ui.notify(`${connected ? "✅" : "⚡"} ${active.name || active.botId.slice(0, 8)} | ${sessions.size} 会话`, "info");
+      else ctx.ui.notify(`${connected ? "✅" : "⚡"} ${active.name || active.botId} | ${sessions.size} 会话`, "info");
     },
   });
 
-  // 开启/关闭
-  pi.registerCommand("wecombot-enable", {
-    description: "开启机器人",
+  // 会话详情
+  pi.registerCommand("wecombot-session", {
+    description: "查看当前会话详情",
     handler: async (_args, ctx) => {
-      cfg.enabled = true;
-      await save(cfg);
-      const bot = getActiveBot(cfg);
-      if (bot) await connect(ctx, bot);
-      ctx.ui.notify("✅ 机器人已开启", "success");
-    },
-  });
-
-  pi.registerCommand("wecombot-disable", {
-    description: "关闭机器人",
-    handler: async (_args, ctx) => {
-      disconnect();
-      cfg.enabled = false;
-      await save(cfg);
-      ctx.ui.notify("✅ 机器人已关闭", "success");
-    },
-  });
-
-  // 测试
-  pi.registerCommand("wecombot-test", {
-    description: "发送测试消息",
-    handler: async (_args, ctx) => {
-      if (!ws || !connected) { ctx.ui.notify("请先配置", "warning"); return; }
-      ctx.ui.notify("⚠️ 请 @机器人 发送消息触发测试", "warning");
+      if (sessions.size === 0) {
+        ctx.ui.notify("暂无活跃会话", "info");
+        return;
+      }
+      const active = getActiveBot(cfg);
+      const sessionList = Array.from(sessions.entries()).map(([reqId, s]) => 
+        `[${active?.name || s.botId}]\n  reqId: ${reqId}\n  userId: ${s.userId}\n  chatId: ${s.chatId}`
+      ).join("\n\n");
+      ctx.ui.notify(`当前会话:\n${sessionList}`, "info");
     },
   });
 
@@ -394,12 +402,20 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
     if (!lastReqId || !sessions.has(lastReqId)) return;
+    
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) return;
+    
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) return;
-    const replyContent = txt.replace(/\[wecombot\] \[([^\]]+)\]\n?/g, "");
-    replyTo(lastReqId, replyContent, true);
-    console.log(`[wecombot] 回复: ${replyContent.slice(0, 50)}`);
+    
+    const active = getActiveBot(cfg);
+    const pattern = new RegExp(`\\[wecombot\\] \\[${active?.name || active?.botId || ""}\\] \\[([^\\]]+)\\]\\n?`, "g");
+    const replyContent = txt.replace(pattern, "");
+    
+    if (replyContent.trim()) {
+      replyTo(lastReqId, replyContent, true);
+      console.log(`[wecombot] 回复: ${replyContent.slice(0, 50)}`);
+    }
   });
 }
