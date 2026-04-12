@@ -23,8 +23,8 @@ pi install git:github.com/huang-x-h/pi-wecombot
 ### 1. 创建智能机器人
 
 在企业微信管理后台创建应用，获取：
-- **AgentId** - 应用ID
-- **Secret** - 应用Secret
+- **BotID** - 机器人ID
+- **Secret** - 机器人密钥
 
 ### 2. 在 pi 中配置
 
@@ -32,7 +32,6 @@ pi install git:github.com/huang-x-h/pi-wecombot
 /wecombot-setup
 # BotID: wwxxxxxxxxxxxxx
 # Secret: xxxxxxxxxxxxxxx
-# AgentID(可选):
 ```
 
 ## 命令

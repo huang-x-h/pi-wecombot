@@ -22,7 +22,6 @@ import { Type } from "@sinclair/typebox";
 interface Config {
   botId?: string;
   secret?: string;
-  agentId?: string;
   enabled?: boolean;
 }
 
@@ -311,12 +310,9 @@ export default function (pi: ExtensionAPI) {
       const secret = await ctx.ui.input("Secret", "");
       if (!secret) return;
 
-      const agentId = await ctx.ui.input("AgentID(可选)", "");
-
       cfg = {
         botId: botId.trim(),
         secret: secret.trim(),
-        agentId: agentId?.trim() || undefined,
         enabled: true,
       };
       await save(cfg);
