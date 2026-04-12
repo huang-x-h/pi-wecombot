@@ -10,7 +10,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import Aibot from "aibot-node-sdk";
+import { AiBot } from "aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -90,7 +90,7 @@ export default function (pi: ExtensionAPI) {
     disconnect();
 
     console.log("[wecom] 连接中...");
-    bot = new Aibot({ key: cfg.key, secret: cfg.secret });
+    bot = new AiBot({ key: cfg.key, secret: cfg.secret });
 
     bot.on("onStart", () => {
       console.log("[wecom] ✅ 已连接");
