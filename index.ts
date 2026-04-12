@@ -1,5 +1,5 @@
 /**
- * pi-wecom
+ * pi-wecombot
  * 
  * 企业微信群机器人长连接扩展 for pi
  * 
@@ -176,7 +176,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "wecom_send",
+    name: "wecombot_send",
     label: "发送消息",
     description: "发送消息到企业微信群",
     parameters: Type.Object({
@@ -198,27 +198,21 @@ export default function (pi: ExtensionAPI) {
   // Commands
   // ============================================================================
 
-  pi.registerCommand("wecom-setup", {
+  pi.registerCommand("wecombot-setup", {
     description: "配置企业微信机器人",
     handler: async (_args, ctx) => {
-      const url = await ctx.ui.input("Webhook URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx");
-      if (!url) return;
-
-      const key = new URL(url).searchParams.get("key");
-      if (!key) {
-        ctx.ui.notify("❌ URL中未找到key", "error");
-        return;
-      }
+      const key = await ctx.ui.input("机器人 Key", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+      if (!key) return;
 
       const secret = await ctx.ui.input("加签密钥(可选)", "");
-      cfg = { key, secret: secret || undefined, enabled: true };
+      cfg = { key: key.trim(), secret: secret?.trim() || undefined, enabled: true };
       await save(cfg);
       ctx.ui.notify("✅ 配置已保存", "success");
       await connect(ctx);
     },
   });
 
-  pi.registerCommand("wecom-status", {
+  pi.registerCommand("wecombot-status", {
     description: "查看机器人状态",
     handler: async (_args, ctx) => {
       if (!cfg.key) {
@@ -229,14 +223,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("wecom-test", {
+  pi.registerCommand("wecombot-test", {
     description: "发送测试消息",
     handler: async (_args, ctx) => {
       if (!cfg.key) {
         ctx.ui.notify("请先配置", "warning");
         return;
       }
-      await send(`🧪 ${new Date().toLocaleString("zh-CN")} | pi-wecom`);
+      await send(`🧪 ${new Date().toLocaleString("zh-CN")} | pi-wecombot`);
       ctx.ui.notify("✅ 已发送", "success");
     },
   });

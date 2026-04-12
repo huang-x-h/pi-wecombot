@@ -1,5 +1,5 @@
 {
-  "webhookUrl": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "key": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "secret": "",
   "enabled": true
 }
