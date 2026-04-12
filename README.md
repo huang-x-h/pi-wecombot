@@ -1,31 +1,6 @@
 # pi-wecom
 
-> 企业微信群机器人(Webhook + 长连接) bridge extension for pi
-
-基于企业微信群机器人Webhook接口实现，支持Webhook和长连接两种模式。
-
-## 功能特性
-
-### 两种连接模式
-
-| 模式 | 说明 | 适用场景 |
-|------|------|---------|
-| **Webhook** | HTTP POST发送消息 | 简单推送，无需接收回复 |
-| **长连接** | WebSocket保持连接 | 实时双向通信，支持消息回调 |
-
-### 消息类型支持
-
-- ✅ 文本消息
-- ✅ Markdown格式
-- ✅ 图片消息（base64）
-- ✅ 图文链接卡片
-- ✅ 消息分片（自动处理长消息）
-
-### 其他特性
-
-- ✅ 加签密钥验证
-- ✅ 自动重连（长连接模式）
-- ✅ 配置文件持久化
+> 企业微信群机器人长连接(WebSocket) bridge extension for pi
 
 ## 安装
 
@@ -35,90 +10,38 @@ pi install git:github.com/huang-x-h/pi-wecom
 
 ## 配置
 
-### 1. 创建群机器人
+### 1. 添加群机器人
 
-1. 打开企业微信电脑客户端
-2. 进入任意群聊 → 群设置 → 群机器人
-3. 添加机器人 → 复制 Webhook URL
+企业微信群 → 群设置 → 群机器人 → 添加机器人 → 复制 Webhook URL
 
-### 2. pi中配置
+### 2. 在 pi 中配置
 
 ```bash
 /wecom-bot-setup
 ```
 
-选择连接模式：
-- `webhook-only`: 仅Webhook推送
-- `long-connection`: 长连接模式
-
-## 使用
-
-### 命令
+## 命令
 
 | 命令 | 说明 |
 |------|------|
 | `/wecom-bot-setup` | 配置机器人 |
 | `/wecom-bot-status` | 查看状态 |
 | `/wecom-bot-test` | 发送测试消息 |
-| `/wecom-bot-enable` | 启用机器人 |
-| `/wecom-bot-disable` | 禁用机器人 |
 
-### 工具
+## 工具
 
 | 工具 | 说明 |
 |------|------|
-| `wecom_send` | 发送消息到群聊 |
-| `wecombot_attach` | 发送文件到群聊 |
+| `wecom_send` | 发送消息 |
+| `wecombot_attach` | 发送文件 |
 
-## 架构设计
-
-### Webhook模式
+## 长连接流程
 
 ```
-┌─────────────┐      HTTP POST      ┌─────────────┐
-│             │ ─────────────────► │             │
-│   企业微信    │    消息推送        │     pi      │
-│   群机器人    │                   │   Extension  │
-│             │                    │             │
-└─────────────┘                    └─────────────┘
+1. 解析 Webhook URL 获取 key
+2. 建立 WebSocket: wss://qyapi.weixin.qq.com/wvp/session/longconnection?key=xxx
+3. 自动重连保持连接
 ```
-
-### 长连接模式
-
-```
-┌─────────────┐                   ┌─────────────┐
-│             │ ◄──── WebSocket ──►│             │
-│   企业微信    │    双向实时通信     │     pi      │
-│   群机器人    │                   │   Extension  │
-│             │ ─────────────────► │             │
-└─────────────┘    消息回调        └─────────────┘
-```
-
-## 长连接模式说明
-
-### 工作原理
-
-1. 建立WebSocket连接到 `wss://qyapi.weixin.qq.com/wvp/session/longconnection`
-2. 通过连接接收群聊消息
-3. 通过连接发送回复消息
-4. 自动重连保持连接
-
-### 适用场景
-
-- 需要实时响应群成员消息
-- 需要@机器人进行交互
-- ChatOps场景
-
-## 常见问题
-
-### Q: 添加机器人时没有"群机器人"选项？
-A: 确保是企业微信专业版，部分版本需要管理员开启。
-
-### Q: 长连接模式需要特殊配置吗？
-A: 只需要有效的Webhook URL，系统自动建立长连接。
-
-### Q: 如何@群成员？
-A: 使用 `<@userid>` 格式。
 
 ## License
 
