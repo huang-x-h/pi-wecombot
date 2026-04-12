@@ -30,7 +30,6 @@ interface Session {
   frame: any;
   streamId: string;
   userId: string;
-  userName?: string;
   chatId: string;
   timestamp: number;
 }
@@ -116,7 +115,7 @@ export default function (pi: ExtensionAPI) {
 
   // 获取用户标识
   function getUserTag(session: Session): string {
-    return session.userName || session.userId || "未知用户";
+    return session.userId || "unknown";
   }
 
   // Connect
@@ -148,12 +147,12 @@ export default function (pi: ExtensionAPI) {
       const content = frame.body?.text?.content || "";
       if (!content) return;
 
-      const reqId = frame.req_id || generateReqId("msg");
-      const userId = frame.body?.from_info?.userid || "unknown";
-      const userName = frame.body?.from_info?.user_name || "";
-      const chatId = frame.body?.from_info?.chat_id || "";
+      const reqId = frame.headers?.req_id || generateReqId("msg");
+      const userId = frame.body?.from?.userid || "unknown";
+      const chatId = frame.body?.chatid || "";
+      const chatType = frame.body?.chattype || "single";
 
-      console.log(`[wecom-bot] [${getUserTag({ userId, userName, chatId, frame, streamId: "", timestamp: 0 })}] ${content.slice(0, 30)}`);
+      console.log(`[wecom-bot] [${userId}] ${content.slice(0, 30)}`);
 
       // 创建新会话
       const streamId = generateReqId("stream");
@@ -161,7 +160,6 @@ export default function (pi: ExtensionAPI) {
         frame,
         streamId,
         userId,
-        userName,
         chatId,
         timestamp: Date.now(),
       });
@@ -172,30 +170,29 @@ export default function (pi: ExtensionAPI) {
       // 转发给 pi，包含用户信息
       pi.sendUserMessage([{
         type: "text",
-        text: `[wecom-bot] [${getUserTag({ userId, userName, chatId, frame, streamId: "", timestamp: 0 })}]\n${content}`,
+        text: `[wecom-bot] [${userId}]\n${content}`,
       }]);
     });
 
     // 图片消息
     ws.on("message.image", (frame: any) => {
       const url = frame.body?.image?.url;
-      const reqId = frame.req_id || generateReqId("msg");
+      const reqId = frame.headers?.req_id || generateReqId("msg");
       if (url) {
-        const userName = frame.body?.from_info?.user_name || frame.body?.from_info?.userid || "未知";
-        console.log(`[wecom-bot] [${userName}] 收到图片`);
+        const userId = frame.body?.from?.userid || "unknown";
+        console.log(`[wecom-bot] [${userId}] 收到图片`);
         
         sessions.set(reqId, {
           frame,
           streamId: generateReqId("stream"),
-          userId: frame.body?.from_info?.userid || "",
-          userName,
-          chatId: frame.body?.from_info?.chat_id || "",
+          userId,
+          chatId: frame.body?.chatid || "",
           timestamp: Date.now(),
         });
 
         pi.sendUserMessage([{
           type: "text",
-          text: `[wecom-bot] [${userName}] 发送了图片: ${url}`,
+          text: `[wecom-bot] [${userId}] 发送了图片: ${url}`,
         }]);
       }
     });
