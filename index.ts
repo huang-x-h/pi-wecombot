@@ -1,15 +1,21 @@
 /**
- * pi-wecom
+ * pi-wecom-bot
  * 
- * 企业微信(WeCom) DM bridge for pi
+ * 企业微信智能机器人(Webhook) DM bridge for pi
  * 
- * 基于 pi-telegram 架构设计
- * 参考: https://github.com/badlogic/pi-telegram
+ * 基于企业微信群机器人Webhook接口实现
+ * 参考: https://open.work.weixin.qq.com/help2/pc/cat?doc_id=21657
+ * 
+ * 特点：
+ * - 无需企业ID和Secret，仅需Webhook URL
+ * - 支持文本、Markdown、图片、文件等消息
+ * - 支持加签密钥验证
  */
 
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
+import { createHmac, randomUUID } from "node:crypto";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -20,135 +26,122 @@ import { Type } from "@sinclair/typebox";
 // Type Definitions
 // ============================================================================
 
-interface WeComConfig {
-  corpId?: string;
-  agentId?: string;
-  corpSecret?: string;
-  webhookUrl?: string;
-  allowedUserId?: string;
-  token?: string;
-  aesKey?: string;
-  lastUpdateId?: number;
+interface WeComBotConfig {
+  webhookUrl?: string;      // Webhook URL（必需）
+  secret?: string;          // 加签密钥（可选）
+  enabled?: boolean;        // 是否启用
 }
 
-interface WeComApiResponse<T = unknown> {
+interface WeComApiResponse {
   errcode: number;
   errmsg: string;
-  result?: T;
 }
 
-interface WeComTokenResponse {
-  errcode: number;
-  errmsg: string;
-  access_token?: string;
-  expires_in?: number;
-}
-
-interface WeComUser {
-  userid: string;
-  name: string;
-  department: number[];
-}
-
-interface WeComMessage {
-  msgId: string;
-  fromUserName: string;
-  toUserName: string;
-  msgType: string;
-  content: string;
-  createTime: number;
-}
-
-interface PendingWeComTurn {
-  userId: string;
-  replyToMessageId: string;
-  queuedAttachments: QueuedAttachment[];
+interface PendingMessage {
   content: Array<TextContent | ImageContent>;
-  historyText: string;
+  timestamp: number;
 }
-
-type ActiveWeComTurn = PendingWeComTurn;
 
 interface QueuedAttachment {
   path: string;
   fileName: string;
 }
 
-interface DownloadedFile {
-  path: string;
-  fileName: string;
-  isImage: boolean;
-  mimeType?: string;
-}
-
 // ============================================================================
 // Constants
 // ============================================================================
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "wecom.json");
-const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "wecom");
-const WECOM_PREFIX = "[wecom]";
-const MAX_MESSAGE_LENGTH = 2048; // 企业微信消息长度限制
+const CONFIG_PATH = join(homedir(), ".pi", "agent", "wecom-bot.json");
+const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "wecom-bot");
+const WECOM_BOT_PREFIX = "[wecom-bot]";
+const MAX_MESSAGE_LENGTH = 4096; // 企业微信机器人消息长度限制
 const MAX_ATTACHMENTS_PER_TURN = 10;
-const MAX_RETRY_COUNT = 3;
-const TOKEN_EXPIRE_BUFFER = 60000; // token过期前1分钟刷新
 
+// 系统提示词
 const SYSTEM_PROMPT_SUFFIX = `
 
-企业微信桥接扩展已激活。
-- 从企业微信转发的消息会以 "[wecom]" 前缀标记。
-- [wecom] 消息可能包含企业微信附件的本地文件路径。需要时读取这些文件。
-- 如果企业微信用户请求文件或生成的产物，请使用 telegram_attach 工具并附带本地文件路径，以便扩展可以在下次回复时发送。
-- 不要假设在纯文本中提及本地文件路径就会将其发送到企业微信，必须使用 telegram_attach。`;
+企业微信机器人桥接扩展已激活。
+- 所有通过企业微信机器人发送的消息都会标记 [wecom-bot]
+- 机器人在群聊中推送消息
+- 如果用户请求文件或生成的产物，调用 telegram_attach 工具将其发送到企业微信群`;
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-function isWeComPrompt(prompt: string): boolean {
-  return prompt.trimStart().startsWith(WECOM_PREFIX);
+function isWeComBotPrompt(prompt: string): boolean {
+  return prompt.trimStart().startsWith(WECOM_BOT_PREFIX);
 }
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
-function guessExtensionFromMime(mimeType: string | undefined, fallback: string): string {
-  if (!mimeType) return fallback;
-  const normalized = mimeType.toLowerCase();
-  if (normalized === "image/jpeg") return ".jpg";
-  if (normalized === "image/png") return ".png";
-  if (normalized === "image/webp") return ".webp";
-  if (normalized === "image/gif") return ".gif";
-  if (normalized === "audio/ogg") return ".ogg";
-  if (normalized === "audio/mpeg") return ".mp3";
-  if (normalized === "audio/wav") return ".wav";
-  if (normalized === "video/mp4") return ".mp4";
-  if (normalized === "application/pdf") return ".pdf";
-  return fallback;
+/**
+ * 根据文件扩展名猜测MIME类型
+ */
+function guessMimeType(fileName: string): string {
+  const ext = fileName.toLowerCase().split(".").pop();
+  const mimeTypes: Record<string, string> = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "webp": "image/webp",
+    "mp4": "video/mp4",
+    "avi": "video/avi",
+    "mov": "video/quicktime",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "zip": "application/zip",
+    "rar": "application/x-rar-compressed",
+    "txt": "text/plain",
+    "json": "application/json",
+    "xml": "text/xml",
+    "html": "text/html",
+    "css": "text/css",
+    "js": "application/javascript",
+    "ts": "text/typescript",
+  };
+  return mimeTypes[ext || ""] || "application/octet-stream";
 }
 
-function guessMediaType(path: string): string | undefined {
-  const ext = path.toLowerCase().split(".").pop();
-  switch (ext) {
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "png":
-      return "image/png";
-    case "webp":
-      return "image/webp";
-    case "gif":
-      return "image/gif";
-    default:
-      return undefined;
-  }
+/**
+ * 判断是否为图片类型
+ */
+function isImageType(mimeType: string): boolean {
+  return mimeType.startsWith("image/");
 }
 
-function isImageMimeType(mimeType: string | undefined): boolean {
-  return mimeType?.toLowerCase().startsWith("image/") ?? false;
+/**
+ * 格式化文件大小
+ */
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+/**
+ * 生成签名（用于加签密钥验证）
+ */
+function generateSignature(secret: string, timestamp: string): string {
+  const stringToSign = `${timestamp}\n${secret}`;
+  return createHmac("sha256", secret).update(stringToSign, "utf8").digest("base64");
+}
+
+/**
+ * 文本分片
+ */
 function chunkText(text: string): string[] {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text];
 
@@ -161,65 +154,46 @@ function chunkText(text: string): string[] {
     current = "";
   };
 
-  const splitLongBlock = (block: string): string[] => {
-    if (block.length <= MAX_MESSAGE_LENGTH) return [block];
-    const lines = block.split("\n");
-    const lineChunks: string[] = [];
-    let lineCurrent = "";
-
-    for (const line of lines) {
-      const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
-      if (candidate.length <= MAX_MESSAGE_LENGTH) {
-        lineCurrent = candidate;
-        continue;
-      }
-      if (lineCurrent.length > 0) {
-        lineChunks.push(lineCurrent);
-        lineCurrent = "";
-      }
-      if (line.length <= MAX_MESSAGE_LENGTH) {
-        lineCurrent = line;
-        continue;
-      }
-      // 超长行，按长度分割
-      for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
-        lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
-      }
-    }
-    if (lineCurrent.length > 0) lineChunks.push(lineCurrent);
-    return lineChunks;
-  };
-
   for (const paragraph of paragraphs) {
     if (paragraph.length === 0) continue;
-    const parts = splitLongBlock(paragraph);
-    for (const part of parts) {
-      const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
+    
+    if (paragraph.length <= MAX_MESSAGE_LENGTH) {
+      const candidate = current.length === 0 ? paragraph : `${current}\n\n${paragraph}`;
       if (candidate.length <= MAX_MESSAGE_LENGTH) {
         current = candidate;
       } else {
         flushCurrent();
-        current = part;
+        current = paragraph;
       }
+    } else {
+      flushCurrent();
+      // 超长段落按行分割
+      const lines = paragraph.split("\n");
+      let lineBuffer = "";
+      
+      for (const line of lines) {
+        const newBuffer = lineBuffer.length === 0 ? line : `${lineBuffer}\n${line}`;
+        if (newBuffer.length <= MAX_MESSAGE_LENGTH) {
+          lineBuffer = newBuffer;
+        } else {
+          if (lineBuffer) chunks.push(lineBuffer);
+          lineBuffer = line.length <= MAX_MESSAGE_LENGTH ? line : "";
+        }
+      }
+      
+      if (lineBuffer) chunks.push(lineBuffer);
     }
   }
+
   flushCurrent();
   return chunks;
-}
-
-function formatTokens(count: number): string {
-  if (count < 1000) return count.toString();
-  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-  if (count < 1000000) return `${Math.round(count / 1000)}k`;
-  if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-  return `${Math.round(count / 1000000)}M`;
 }
 
 // ============================================================================
 // Config Management
 // ============================================================================
 
-async function readConfig(): Promise<WeComConfig> {
+async function readConfig(): Promise<WeComBotConfig> {
   try {
     const content = await readFile(CONFIG_PATH, "utf8");
     return JSON.parse(content);
@@ -228,7 +202,7 @@ async function readConfig(): Promise<WeComConfig> {
   }
 }
 
-async function writeConfig(config: WeComConfig): Promise<void> {
+async function writeConfig(config: WeComBotConfig): Promise<void> {
   await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
   await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
@@ -238,14 +212,10 @@ async function writeConfig(config: WeComConfig): Promise<void> {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-  let config: WeComConfig = {};
-  let queuedWeComTurns: PendingWeComTurn[] = [];
-  let activeWeComTurn: ActiveWeComTurn | undefined;
-  let currentAbort: (() => void) | undefined;
-  let preserveQueuedTurnsAsHistory = false;
+  let config: WeComBotConfig = {};
+  let queuedMessages: PendingMessage[] = [];
+  let activeMessage: PendingMessage | undefined;
   let setupInProgress = false;
-  let accessToken: string | undefined;
-  let tokenExpireTime = 0;
 
   // ============================================================================
   // Status Management
@@ -253,217 +223,165 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatus(ctx: ExtensionContext, error?: string): void {
     const theme = ctx.ui.theme;
-    const label = theme.fg("accent", "wecom");
+    const label = theme.fg("accent", "wecom-bot");
+    
     if (error) {
-      ctx.ui.setStatus("wecom", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
+      ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
       return;
     }
-    if (!config.corpId || !config.agentId || !config.corpSecret) {
-      ctx.ui.setStatus("wecom", `${label} ${theme.fg("muted", "not configured")}`);
+    
+    if (!config.webhookUrl) {
+      ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("muted", "not configured")}`);
       return;
     }
-    if (!config.allowedUserId) {
-      ctx.ui.setStatus("wecom", `${label} ${theme.fg("warning", "awaiting pairing")}`);
+    
+    if (!config.enabled) {
+      ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("warning", "disabled")}`);
       return;
     }
-    if (activeWeComTurn || queuedWeComTurns.length > 0) {
-      const queued = queuedWeComTurns.length > 0 ? theme.fg("muted", ` +${queuedWeComTurns.length} queued`) : "";
-      ctx.ui.setStatus("wecom", `${label} ${theme.fg("accent", "processing")}${queued}`);
-      return;
-    }
-    ctx.ui.setStatus("wecom", `${label} ${theme.fg("success", "connected")}`);
+    
+    ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("success", "ready")}`);
   }
 
   // ============================================================================
-  // WeCom API
+  // WeCom Bot API
   // ============================================================================
 
-  async function getAccessToken(): Promise<string> {
-    if (accessToken && Date.now() < tokenExpireTime) {
-      return accessToken;
+  /**
+   * 发送消息到企业微信群
+   */
+  async function sendMessage(message: Record<string, unknown>): Promise<void> {
+    if (!config.webhookUrl) {
+      throw new Error("请先配置企业微信机器人 Webhook URL");
     }
 
-    if (!config.corpId || !config.corpSecret) {
-      throw new Error("请先配置企业微信凭证：corpId 和 corpSecret");
-    }
-
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${config.corpId}&corpsecret=${config.corpSecret}`;
+    let url = config.webhookUrl;
     
+    // 如果配置了加签密钥，添加签名
+    if (config.secret) {
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const sign = generateSignature(config.secret, timestamp);
+      const separator = url.includes("?") ? "&" : "?";
+      url = `${url}${separator}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+    }
+
     try {
-      const response = await fetch(url);
-      const data = (await response.json()) as WeComTokenResponse;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(message),
+      });
+
+      const data = (await response.json()) as WeComApiResponse;
 
       if (data.errcode !== 0) {
-        // 常见的错误码及说明
-        const errorMessages: Record<number, string> = {
-          40013: "CorpID无效，请检查CorpID是否正确",
-          40001: "Secret无效，请检查Secret是否正确",
-          40032: "Secret错误，请确认是企业应用的Secret而非通讯录Secret",
-          41002: "corpId或corpSecret为空",
-          42001: "access_token已过期",
-        };
-        
-        const knownError = errorMessages[data.errcode];
-        const errorDetail = knownError || `错误码: ${data.errcode}`;
-        throw new Error(`获取access_token失败: ${data.errmsg} (${errorDetail})`);
+        throw new Error(`发送失败 [${data.errcode}]: ${data.errmsg}`);
       }
-
-      if (!data.access_token) {
-        throw new Error("获取access_token失败：返回数据无效");
-      }
-
-      accessToken = data.access_token;
-      tokenExpireTime = Date.now() + ((data.expires_in || 7200) - 60) * 1000;
-      console.log(`[wecom] access_token获取成功，有效期: ${data.expires_in || 7200}秒`);
-      return accessToken;
     } catch (error) {
       if (error instanceof Error) {
         throw error;
       }
-      throw new Error(`获取access_token失败: ${String(error)}`);
+      throw new Error(`发送失败: ${String(error)}`);
     }
   }
 
-  async function callWeComApi<T>(
-    method: string,
-    body: Record<string, unknown>,
-    retries = MAX_RETRY_COUNT
-  ): Promise<T> {
-    const token = await getAccessToken();
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/${method}?access_token=${token}`;
-
-    for (let attempt = 0; attempt < retries; attempt++) {
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = (await response.json()) as WeComApiResponse<T>;
-
-        if (data.errcode === 40014 || data.errcode === 42001) {
-          // token过期或无效，重新获取并重试
-          accessToken = undefined;
-          const newToken = await getAccessToken();
-          const retryUrl = `https://qyapi.weixin.qq.com/cgi-bin/${method}?access_token=${newToken}`;
-          const retryResponse = await fetch(retryUrl, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(body),
-          });
-          const retryData = (await retryResponse.json()) as WeComApiResponse<T>;
-          if (retryData.errcode !== 0) {
-            throw new Error(`[${retryData.errcode}] ${retryData.errmsg}`);
-          }
-          // 企业微信API返回数据直接在根对象
-          return (retryData as unknown) as T;
-        }
-
-        if (data.errcode !== 0) {
-          throw new Error(`[${data.errcode}] ${data.errmsg}`);
-        }
-        // 企业微信API返回数据直接在根对象
-        return (data as unknown) as T;
-      } catch (error) {
-        if (attempt === retries - 1) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
-      }
-    }
-    throw new Error("重试次数耗尽");
-  }
-
-  async function sendTextMessage(userId: string, content: string): Promise<void> {
-    const chunks = chunkText(content);
+  /**
+   * 发送文本消息
+   */
+  async function sendText(text: string): Promise<void> {
+    const chunks = chunkText(text);
     for (const chunk of chunks) {
-      await callWeComApi("message/send", {
-        touser: userId,
+      await sendMessage({
         msgtype: "text",
-        agentid: Number(config.agentId),
-        text: { content: chunk },
+        text: {
+          content: chunk,
+        },
       });
     }
   }
 
-  async function sendMarkdownMessage(userId: string, content: string): Promise<void> {
+  /**
+   * 发送Markdown消息
+   */
+  async function sendMarkdown(content: string): Promise<void> {
     const chunks = chunkText(content);
     for (const chunk of chunks) {
-      await callWeComApi("message/send", {
-        touser: userId,
+      await sendMessage({
         msgtype: "markdown",
-        agentid: Number(config.agentId),
-        markdown: { content: chunk },
+        markdown: {
+          content: chunk,
+        },
       });
     }
   }
 
-  async function sendNewsMessage(userId: string, articles: Array<{
-    title: string;
-    description: string;
-    url: string;
-    picurl: string;
-  }>): Promise<void> {
-    await callWeComApi("message/send", {
-      touser: userId,
-      msgtype: "news",
-      agentid: Number(config.agentId),
-      news: { articles },
-    });
-  }
-
-  async function uploadFile(filePath: string): Promise<string> {
-    const token = await getAccessToken();
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${token}&type=file`;
-    
-    const buffer = await readFile(filePath);
-    const form = new FormData();
-    form.set("media", new Blob([buffer]), basename(filePath));
-
-    const response = await fetch(url, {
-      method: "POST",
-      body: form,
-    });
-    const data = (await response.json()) as WeComApiResponse<{ media_id: string }>;
-
-    if (data.errcode !== 0) {
-      throw new Error(`上传文件失败: ${data.errmsg}`);
-    }
-    return data.result!.media_id;
-  }
-
-  async function sendFileMessage(userId: string, filePath: string): Promise<void> {
-    const mediaId = await uploadFile(filePath);
-    await callWeComApi("message/send", {
-      touser: userId,
-      msgtype: "file",
-      agentid: Number(config.agentId),
-      file: { media_id: mediaId },
-    });
-  }
-
-  async function sendImageMessage(userId: string, filePath: string): Promise<void> {
-    const token = await getAccessToken();
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${token}&type=image`;
-    
-    const buffer = await readFile(filePath);
-    const form = new FormData();
-    form.set("media", new Blob([buffer]), basename(filePath));
-
-    const response = await fetch(url, {
-      method: "POST",
-      body: form,
-    });
-    const data = (await response.json()) as WeComApiResponse<{ media_id: string }>;
-
-    if (data.errcode !== 0) {
-      throw new Error(`上传图片失败: ${data.errmsg}`);
-    }
-
-    await callWeComApi("message/send", {
-      touser: userId,
+  /**
+   * 发送图片（base64格式）
+   */
+  async function sendImage(base64Data: string, md5: string): Promise<void> {
+    await sendMessage({
       msgtype: "image",
-      agentid: Number(config.agentId),
-      image: { media_id: data.result!.media_id },
+      image: {
+        base64: base64Data,
+        md5: md5,
+      },
     });
+  }
+
+  /**
+   * 发送图文消息（链接卡片）
+   */
+  async function sendNews(
+    title: string,
+    description: string,
+    url: string,
+    picUrl?: string
+  ): Promise<void> {
+    await sendMessage({
+      msgtype: "news",
+      news: {
+        articles: [
+          {
+            title,
+            description,
+            url,
+            picurl: picUrl || "",
+          },
+        ],
+      },
+    });
+  }
+
+  /**
+   * 发送文件（通过media_id，需要先上传素材）
+   * 注意：机器人文件消息需要先将文件上传为临时素材
+   */
+  async function sendFile(filePath: string): Promise<void> {
+    // 企业微信群机器人暂时不支持直接发送文件
+    // 建议使用图文消息或提示用户下载链接
+    await sendText(`📎 文件: ${basename(filePath)}\n请查看附件或访问相关链接`);
+  }
+
+  /**
+   * 发送纯文本消息（富文本卡片）
+   */
+  async function sendTextCard(
+    title: string,
+    description: string,
+    btnText?: string,
+    btnUrl?: string
+  ): Promise<void> {
+    const message: Record<string, unknown> = {
+      msgtype: "textcard",
+      textcard: {
+        title,
+        description,
+        url: btnUrl || "https://work.weixin.qq.com/",
+        btntxt: btnText || "更多",
+      },
+    };
+
+    await sendMessage(message);
   }
 
   // ============================================================================
@@ -475,52 +393,39 @@ export default function (pi: ExtensionAPI) {
     setupInProgress = true;
 
     try {
-      // 1. 获取企业ID
-      const corpId = await ctx.ui.input("企业微信 CorpID", "wwxxxxxxxxxxxxxxxx");
-      if (!corpId) return;
+      // 1. 获取 Webhook URL
+      const webhookUrl = await ctx.ui.input(
+        "企业微信群机器人 Webhook URL",
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      );
+      if (!webhookUrl) return;
 
-      // 2. 获取应用AgentID
-      const agentId = await ctx.ui.input("企业微信 AgentId", "1000002");
-      if (!agentId) return;
+      // 2. 获取加签密钥（可选）
+      const secret = await ctx.ui.input(
+        "加签密钥（可选，直接回车跳过）",
+        ""
+      );
 
-      // 3. 获取应用Secret
-      const corpSecret = await ctx.ui.input("企业微信 Agent Secret", "xxxxxxxxxxxxxxxxxxxx");
-      if (!corpSecret) return;
-
-      // 4. 验证配置
-      const nextConfig: WeComConfig = {
-        corpId: corpId.trim(),
-        agentId: agentId.trim(),
-        corpSecret: corpSecret.trim(),
+      // 3. 验证配置
+      const nextConfig: WeComBotConfig = {
+        webhookUrl: webhookUrl.trim(),
+        secret: secret.trim() || undefined,
+        enabled: true,
       };
 
-      // 测试获取access_token（临时使用新配置）
-      const tempAccessToken = accessToken;
-      const tempTokenExpireTime = tokenExpireTime;
-      const tempConfig = config;
-      
+      // 测试发送
       try {
-        // 临时替换为新配置进行测试
-        config = nextConfig;
-        accessToken = undefined; // 强制重新获取
-        
-        const token = await getAccessToken();
-        ctx.ui.notify(`Token获取成功: ${token.substring(0, 10)}...`, "info");
+        await sendText("🔔 pi-wecom-bot 连接测试\n\n配置成功！机器人已准备就绪。");
+        ctx.ui.notify("✅ Webhook 连接成功！", "success");
       } catch (error) {
-        // 恢复原配置
-        accessToken = tempAccessToken;
-        tokenExpireTime = tempTokenExpireTime;
-        config = tempConfig;
-        
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`配置验证失败: ${message}`, "error");
+        const msg = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`❌ 连接失败: ${msg}`, "error");
         return;
       }
 
       config = nextConfig;
       await writeConfig(config);
-      ctx.ui.notify("企业微信配置完成！", "success");
-      ctx.ui.notify("在企业微信中向应用发送消息以完成配对。", "info");
+      ctx.ui.notify("企业微信机器人配置完成！", "success");
       updateStatus(ctx);
     } finally {
       setupInProgress = false;
@@ -528,7 +433,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ============================================================================
-  // Turn Management
+  // Tool Result Handlers
   // ============================================================================
 
   function isAssistantMessage(message: AgentMessage): boolean {
@@ -570,146 +475,22 @@ export default function (pi: ExtensionAPI) {
     return {};
   }
 
-  async function createWeComTurn(
-    content: Array<TextContent | ImageContent>,
-    userId: string,
-    historyTurns: PendingWeComTurn[] = []
-  ): Promise<PendingWeComTurn> {
-    let prompt = WECOM_PREFIX;
+  async function processAndSendMessage(text: string): Promise<void> {
+    if (!text) return;
 
-    if (historyTurns.length > 0) {
-      prompt += `\n\nEarlier messages arrived after an aborted turn. Treat them as prior user messages, in order:`;
-      for (const [index, turn] of historyTurns.entries()) {
-        prompt += `\n\n${index + 1}. ${turn.historyText}`;
-      }
-      prompt += `\n\nCurrent message:`;
-    }
-
-    // 提取文本内容
-    const textParts: string[] = [];
-    const imageContents: ImageContent[] = [];
-    
-    for (const item of content) {
-      if (item.type === "text") {
-        textParts.push(item.text);
-      } else if (item.type === "image") {
-        imageContents.push(item);
-      }
-    }
-
-    const rawText = textParts.join("\n\n");
-    if (historyTurns.length > 0 || rawText.length > 0) {
-      prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
-    }
-
-    const finalContent: Array<TextContent | ImageContent> = [{ type: "text", text: prompt }];
-    
-    // 添加图片
-    for (const img of imageContents) {
-      finalContent.push(img);
-    }
-
-    return {
-      userId,
-      replyToMessageId: "",
-      queuedAttachments: [],
-      content: finalContent,
-      historyText: rawText || "(no text)",
-    };
-  }
-
-  async function sendQueuedAttachments(turn: ActiveWeComTurn): Promise<void> {
-    for (const attachment of turn.queuedAttachments) {
-      try {
-        const mediaType = guessMediaType(attachment.path);
-        if (mediaType && isImageMimeType(mediaType)) {
-          await sendImageMessage(turn.userId, attachment.path);
-        } else {
-          await sendFileMessage(turn.userId, attachment.path);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await sendTextMessage(turn.userId, `发送附件失败 ${attachment.fileName}: ${message}`);
-      }
-    }
-  }
-
-  async function dispatchWeComMessage(
-    userId: string,
-    content: string,
-    ctx: ExtensionContext
-  ): Promise<void> {
-    const lower = content.toLowerCase().trim();
-
-    // 处理内置命令
-    if (lower === "stop" || lower === "/stop") {
-      if (currentAbort) {
-        if (queuedWeComTurns.length > 0) {
-          preserveQueuedTurnsAsHistory = true;
-        }
-        currentAbort();
-        updateStatus(ctx);
-        await sendTextMessage(userId, "已中止当前任务。");
-      } else {
-        await sendTextMessage(userId, "没有正在执行的任务。");
-      }
-      return;
-    }
-
-    if (lower === "/status") {
-      let totalInput = 0;
-      let totalOutput = 0;
-      let totalCost = 0;
-
-      for (const entry of ctx.sessionManager.getEntries()) {
-        if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-        totalInput += entry.message.usage.input;
-        totalOutput += entry.message.usage.output;
-        totalCost += entry.message.usage.cost.total;
-      }
-
-      const usage = ctx.getContextUsage();
-      const lines: string[] = [];
-      if (ctx.model) {
-        lines.push(`模型: ${ctx.model.provider}/${ctx.model.id}`);
-      }
-      if (totalInput) lines.push(`输入: ${formatTokens(totalInput)}`);
-      if (totalOutput) lines.push(`输出: ${formatTokens(totalOutput)}`);
-      if (lines.length === 0) lines.push("暂无使用数据。");
-
-      await sendTextMessage(userId, lines.join("\n"));
-      return;
-    }
-
-    if (lower === "/help" || lower === "/start") {
-      await sendTextMessage(
-        userId,
-        `发送消息给我，我会将其转发到 pi。\n\n可用命令:\n/status - 显示使用统计\n/stop - 停止当前任务\n/help - 显示此帮助`
-      );
-      
-      // 首次配对
-      if (config.allowedUserId === undefined) {
-        config.allowedUserId = userId;
-        await writeConfig(config);
-        updateStatus(ctx);
-        await sendTextMessage(userId, "企业微信桥接已与此账户配对成功！");
-      }
-      return;
-    }
-
-    // 创建任务
-    const historyTurns = preserveQueuedTurnsAsHistory ? queuedWeComTurns.splice(0) : [];
-    preserveQueuedTurnsAsHistory = false;
-    const turn = await createWeComTurn(
-      [{ type: "text", text: content }],
-      userId,
-      historyTurns
-    );
-    queuedWeComTurns.push(turn);
-
-    if (ctx.isIdle()) {
-      updateStatus(ctx);
-      pi.sendUserMessage(turn.content);
+    // 判断消息类型
+    if (text.includes("```")) {
+      // 代码块较多，使用Markdown
+      await sendMarkdown(text);
+    } else if (text.startsWith("#") || text.includes("**")) {
+      // Markdown格式
+      await sendMarkdown(text);
+    } else if (text.includes("\n")) {
+      // 多行文本
+      await sendMarkdown(text);
+    } else {
+      // 普通文本
+      await sendText(text);
     }
   }
 
@@ -720,10 +501,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "telegram_attach",
     label: "WeCom Attach",
-    description: "将本地文件加入队列，在下次回复时通过企业微信发送。",
-    promptSnippet: "将本地文件加入队列，通过企业微信发送。",
+    description: "将本地文件通过企业微信机器人发送到群聊",
+    promptSnippet: "将文件发送到企业微信群",
     promptGuidelines: [
-      "当处理 [wecom] 消息且用户请求文件或生成的产物时，调用 telegram_attach 并附带本地文件路径。",
+      "当用户请求发送文件或生成产物时，调用 telegram_attach 将文件发送到企业微信群",
     ],
     parameters: Type.Object({
       paths: Type.Array(
@@ -732,30 +513,84 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params) {
-      if (!activeWeComTurn) {
-        throw new Error("telegram_attach 只能在回复企业微信消息时使用");
-      }
-
       const added: string[] = [];
+
       for (const inputPath of params.paths) {
         const stats = await stat(inputPath);
         if (!stats.isFile()) {
           throw new Error(`不是文件: ${inputPath}`);
         }
-        if (activeWeComTurn.queuedAttachments.length >= MAX_ATTACHMENTS_PER_TURN) {
-          throw new Error(`附件数量已达上限 (${MAX_ATTACHMENTS_PER_TURN})`);
-        }
-        activeWeComTurn.queuedAttachments.push({
-          path: inputPath,
-          fileName: basename(inputPath),
-        });
+
         added.push(inputPath);
       }
 
+      // 如果有活动消息，直接发送
+      if (activeMessage) {
+        for (const filePath of added) {
+          const mimeType = guessMimeType(filePath);
+          if (isImageType(mimeType)) {
+            const buffer = await readFile(filePath);
+            const base64 = buffer.toString("base64");
+            const md5 = buffer.toString("hex").substring(0, 32);
+            await sendImage(base64, md5);
+          } else {
+            await sendFile(filePath);
+          }
+        }
+      }
+
       return {
-        content: [{ type: "text", text: `已加入 ${added.length} 个附件到队列。` }],
+        content: [
+          {
+            type: "text",
+            text: `已加入 ${added.length} 个附件到发送队列。`,
+          },
+        ],
         details: { paths: added },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "wecom_send",
+    label: "WeCom Send",
+    description: "直接发送消息到企业微信群",
+    parameters: Type.Object({
+      message: Type.String({ description: "要发送的消息内容" }),
+      type: Type.Optional(
+        Type.Union([
+          Type.Literal("text"),
+          Type.Literal("markdown"),
+        ])
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      if (!config.webhookUrl) {
+        throw new Error("请先运行 /wecom-bot-setup 配置机器人");
+      }
+
+      const type = params.type || "text";
+
+      try {
+        if (type === "markdown") {
+          await sendMarkdown(params.message);
+        } else {
+          await sendText(params.message);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ 消息已发送（${type}）`,
+            },
+          ],
+          details: {},
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        throw new Error(`发送失败: ${msg}`);
+      }
     },
   });
 
@@ -763,68 +598,70 @@ export default function (pi: ExtensionAPI) {
   // Register Commands
   // ============================================================================
 
-  pi.registerCommand("wecom-setup", {
-    description: "配置企业微信应用凭证",
+  pi.registerCommand("wecom-bot-setup", {
+    description: "配置企业微信群机器人 Webhook",
     handler: async (_args, ctx) => {
       await promptForConfig(ctx);
     },
   });
 
-  pi.registerCommand("wecom-status", {
-    description: "显示企业微信桥接状态",
+  pi.registerCommand("wecom-bot-status", {
+    description: "查看企业微信机器人状态",
     handler: async (_args, ctx) => {
-      const status = [
-        `应用ID: ${config.agentId || "未配置"}`,
-        `企业ID: ${config.corpId || "未配置"}`,
-        `允许用户: ${config.allowedUserId || "未配对"}`,
-        `活跃任务: ${activeWeComTurn ? "是" : "否"}`,
-        `排队任务: ${queuedWeComTurns.length}`,
-      ];
-      ctx.ui.notify(status.join(" | "), "info");
+      if (config.webhookUrl) {
+        const urlParts = config.webhookUrl.split("/");
+        const keyPart = urlParts[urlParts.length - 1] || "";
+        const keyId = keyPart.replace("key=", "").substring(0, 10);
+        
+        ctx.ui.notify(
+          `状态: ${config.enabled ? "✅ 已启用" : "❌ 已禁用"} | Key: ${keyId}... | 加密: ${config.secret ? "✅ 是" : "❌ 否"}`,
+          "info"
+        );
+      } else {
+        ctx.ui.notify("状态: ❌ 未配置，运行 /wecom-bot-setup 进行配置", "warning");
+      }
     },
   });
 
-  pi.registerCommand("wecom-send", {
-    description: "向企业微信用户发送消息",
-    handler: async (args, ctx) => {
-      if (!config.corpId) {
-        ctx.ui.notify("请先运行 /wecom-setup 配置企业微信", "warning");
-        return;
-      }
-
-      const [userId, ...messageParts] = args.split(" ");
-      const message = messageParts.join(" ");
-
-      if (!userId || !message) {
-        ctx.ui.notify("用法: /wecom-send <用户ID> <消息内容>", "warning");
+  pi.registerCommand("wecom-bot-test", {
+    description: "发送测试消息到企业微信群",
+    handler: async (_args, ctx) => {
+      if (!config.webhookUrl) {
+        ctx.ui.notify("请先运行 /wecom-bot-setup 配置机器人", "warning");
         return;
       }
 
       try {
-        await sendTextMessage(userId, message);
-        ctx.ui.notify(`消息已发送给 ${userId}`, "success");
+        await sendText("🧪 测试消息\n\n来自 pi-wecom-bot 的测试消息");
+        ctx.ui.notify("✅ 测试消息已发送", "success");
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`发送失败: ${errMsg}`, "error");
+        const msg = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`❌ 发送失败: ${msg}`, "error");
       }
     },
   });
 
-  pi.registerCommand("wecom-broadcast", {
-    description: "通过群机器人发送消息（需配置webhook）",
-    handler: async (args, ctx) => {
+  pi.registerCommand("wecom-bot-enable", {
+    description: "启用企业微信机器人",
+    handler: async (_args, ctx) => {
       if (!config.webhookUrl) {
-        ctx.ui.notify("请先在配置中设置企业微信群机器人Webhook URL", "warning");
+        ctx.ui.notify("请先运行 /wecom-bot-setup 配置机器人", "warning");
         return;
       }
+      config.enabled = true;
+      await writeConfig(config);
+      ctx.ui.notify("✅ 机器人已启用", "success");
+      updateStatus(ctx);
+    },
+  });
 
-      if (!args) {
-        ctx.ui.notify("用法: /wecom-broadcast <消息内容>", "warning");
-        return;
-      }
-
-      // 注意：群机器人需要使用不同的API端点
-      ctx.ui.notify("群机器人功能开发中...", "info");
+  pi.registerCommand("wecom-bot-disable", {
+    description: "禁用企业微信机器人",
+    handler: async (_args, ctx) => {
+      config.enabled = false;
+      await writeConfig(config);
+      ctx.ui.notify("✅ 机器人已禁用", "info");
+      updateStatus(ctx);
     },
   });
 
@@ -839,15 +676,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
-    queuedWeComTurns = [];
-    activeWeComTurn = undefined;
-    currentAbort = undefined;
-    preserveQueuedTurnsAsHistory = false;
+    queuedMessages = [];
+    activeMessage = undefined;
   });
 
   pi.on("before_agent_start", async (event) => {
-    const suffix = isWeComPrompt(event.prompt)
-      ? `${SYSTEM_PROMPT_SUFFIX}\n- 当前用户消息来自企业微信。`
+    const suffix = isWeComBotPrompt(event.prompt)
+      ? `${SYSTEM_PROMPT_SUFFIX}\n- 当前消息来自企业微信群机器人。`
       : SYSTEM_PROMPT_SUFFIX;
     return {
       systemPrompt: event.systemPrompt + suffix,
@@ -855,23 +690,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
-    currentAbort = () => ctx.abort();
-    if (!activeWeComTurn && queuedWeComTurns.length > 0) {
-      const nextTurn = queuedWeComTurns.shift();
-      if (nextTurn) {
-        activeWeComTurn = { ...nextTurn };
-      }
+    if (!activeMessage && queuedMessages.length > 0) {
+      activeMessage = queuedMessages.shift();
     }
     updateStatus(ctx);
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    const turn = activeWeComTurn;
-    currentAbort = undefined;
-    activeWeComTurn = undefined;
+    activeMessage = undefined;
     updateStatus(ctx);
-
-    if (!turn) return;
 
     const assistant = extractAssistantText(event.messages);
 
@@ -880,58 +707,26 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (assistant.stopReason === "error") {
-      await sendTextMessage(
-        turn.userId,
-        assistant.errorMessage || "处理请求时发生错误。"
-      );
+      await sendText(`❌ 处理失败\n\n${assistant.errorMessage || "未知错误"}`);
       return;
     }
 
     if (assistant.text) {
-      await sendMarkdownMessage(turn.userId, assistant.text);
-    }
-
-    // 发送附件
-    if (turn.queuedAttachments.length > 0) {
-      await sendQueuedAttachments(turn);
+      await processAndSendMessage(assistant.text);
     }
   });
 
   // ============================================================================
-  // Message Handler (for manual trigger / webhook)
+  // Public API
   // ============================================================================
 
-  /**
-   * 手动触发处理企业微信消息
-   * 可通过webhook接收或命令触发
-   */
-  async function handleWeComMessage(
-    userId: string,
-    content: string,
-    ctx: ExtensionContext
-  ): Promise<void> {
-    // 验证用户
-    if (config.allowedUserId && userId !== config.allowedUserId) {
-      await sendTextMessage(userId, "此应用未授权给您使用。");
-      return;
-    }
-
-    // 首次配对
-    if (config.allowedUserId === undefined) {
-      config.allowedUserId = userId;
-      await writeConfig(config);
-      updateStatus(ctx);
-      await sendTextMessage(userId, "企业微信桥接已与此账户配对成功！");
-    }
-
-    await dispatchWeComMessage(userId, content, ctx);
-  }
-
-  // 暴露给外部的接口
   return {
-    handleWeComMessage,
-    sendTextMessage,
-    sendMarkdownMessage,
-    sendNewsMessage,
+    sendText,
+    sendMarkdown,
+    sendImage,
+    sendNews,
+    sendTextCard,
+    config,
+    updateStatus,
   };
 }

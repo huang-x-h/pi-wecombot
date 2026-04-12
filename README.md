@@ -1,18 +1,28 @@
 # pi-wecom
 
-> 企业微信(WeCom) DM bridge extension for pi
+> 企业微信群机器人(Webhook) DM bridge extension for pi
 
-基于 [pi-telegram](https://github.com/badlogic/pi-telegram) 架构设计的企业微信集成扩展。
+基于企业微信群机器人Webhook接口实现的pi扩展，支持向群聊推送消息。
 
 ## 功能特性
 
-- ✅ 消息双向转发（企业微信 ↔ pi）
-- ✅ 支持文本、Markdown、图片、文件消息
-- ✅ 自动配对用户
-- ✅ 消息队列与任务中止
-- ✅ 使用统计显示
-- ✅ 文件附件发送
-- ✅ 系统提示词注入
+- ✅ 消息推送（群聊）
+- ✅ 支持文本消息
+- ✅ 支持Markdown格式
+- ✅ 支持图片消息（base64）
+- ✅ 支持图文链接卡片
+- ✅ 支持加签密钥验证
+- ✅ 消息分片（自动处理长消息）
+- ✅ 配置文件持久化
+
+## 与旧版区别
+
+| 特性 | 旧版（企业内部应用） | 新版（群机器人） |
+|------|---------------------|-----------------|
+| 配置复杂度 | 高（CorpID+AgentID+Secret） | 低（仅需Webhook URL） |
+| 消息方向 | 双向（收+发） | 单向（仅发送） |
+| 接入难度 | 需要企业管理员 | 群主即可添加 |
+| 使用场景 | 私聊/应用推送 | 群聊通知 |
 
 ## 安装
 
@@ -37,34 +47,29 @@ pi -e git:github.com/huang-x-h/pi-wecom
 
 ## 配置
 
-### 企业微信后台配置
+### 创建企业微信群机器人
 
-1. 登录 [企业微信管理后台](https://work.weixin.qq.com/)
-2. 进入「应用管理」→ 创建自建应用
-3. 获取以下信息：
-   - `AgentId`（应用ID）
-   - `Secret`（应用密钥）
-4. 获取企业信息：
-   - `CorpId`（企业ID）- 在「我的企业」页面获取
-5. 配置应用「接收消息」：
-   - 启用「接收消息」
-   - 设置「Token」和「EncodingAESKey」
-6. 在应用的「开发者接口」中设置「企业可信IP」
+1. 打开企业微信电脑客户端
+2. 进入任意群聊 → 点击群设置（右上角）
+3. 找到「群机器人」→「添加机器人」
+4. 为机器人设置名称，点击「添加」
+5. 复制机器人的「Webhook URL」
+
+> **注意**：如果有加签密钥，复制保存下来，后面配置需要用到。
 
 ### pi配置
 
 启动pi后，运行：
 
 ```bash
-/wecom-setup
+/wecom-bot-setup
 ```
 
 按提示输入：
-1. 企业ID (CorpID)
-2. 应用AgentID
-3. 应用Secret
+1. Webhook URL（必需）
+2. 加签密钥（可选，直接回车跳过）
 
-配置会保存在 `~/.pi/agent/wecom.json`
+配置会保存在 `~/.pi/agent/wecom-bot.json`
 
 ## 使用
 
@@ -72,80 +77,111 @@ pi -e git:github.com/huang-x-h/pi-wecom
 
 | 命令 | 说明 |
 |------|------|
-| `/wecom-setup` | 配置企业微信凭证 |
-| `/wecom-status` | 查看桥接状态 |
-| `/wecom-send <用户ID> <消息>` | 向指定用户发送消息 |
-| `/wecom-broadcast <消息>` | 通过群机器人广播（需配置webhook） |
+| `/wecom-bot-setup` | 配置群机器人 |
+| `/wecom-bot-status` | 查看机器人状态 |
+| `/wecom-bot-test` | 发送测试消息 |
+| `/wecom-bot-enable` | 启用机器人 |
+| `/wecom-bot-disable` | 禁用机器人 |
 
-### 交互方式
+### LLM可调用工具
 
-1. 在企业微信中向应用发送消息
-2. 消息会被转发到pi，添加 `[wecom]` 前缀
-3. pi的回复会自动发送回企业微信
-
-### 内置命令
-
-在企业微信中发送：
-
-| 命令 | 说明 |
+| 工具 | 说明 |
 |------|------|
-| `/help` 或 `/start` | 显示帮助 |
-| `/status` | 显示使用统计 |
-| `stop` 或 `/stop` | 中止当前任务 |
+| `telegram_attach` | 发送文件到群聊 |
+| `wecom_send` | 发送消息到群聊 |
 
-### 文件发送
+### 使用示例
 
-当企业微信用户请求文件或需要发送附件时，LLM会自动调用 `telegram_attach` 工具：
+```
+# 让AI发送测试消息
+请发送一条测试消息到群里
 
-| 工具名称 | 说明 |
-|---------|------|
-| `telegram_attach` | 将本地文件加入队列，在回复时通过企业微信发送 |
+# 让AI生成分享内容并发送
+帮我分析这段代码，然后发送到群里
 
-#### 使用示例
-
-用户可以请求：
-- "把上面的代码保存为文件并发送给我"
-- "生成分享链接并发送"
-- "导出日志文件"
-
-LLM会：
-1. 生成所需文件
-2. 调用 `telegram_attach` 工具将文件加入发送队列
-3. 扩展在回复时自动将文件发送到企业微信
-
-#### 支持的文件类型
-
-| 类型 | 说明 | 最大限制 |
-|------|------|---------|
-| 图片 (jpg/png/gif/webp) | 作为图片发送 | 10MB |
-| 文档 (pdf/doc/xlsx) | 作为文件发送 | 20MB |
-| 视频 (mp4) | 作为文件发送 | 10MB |
-| 其他 | 作为文件发送 | 20MB |
-
-> **注意**：扩展自动处理文件格式识别，无需手动指定。
+# 发送文件
+把上面的代码保存为文件并发送到群里
+```
 
 ## 架构设计
 
 ```
 ┌─────────────────┐      HTTP/Webhook      ┌──────────────────┐
-│                 │ ◄────────────────────► │                  │
-│   企业微信       │    消息回调/推送         │      pi          │
-│  (自建应用)     │                        │  (Extension)    │
-│                 │ ◄────────────────────► │                  │
+│                 │ ────────────────────►   │                  │
+│   企业微信群      │    消息推送             │      pi          │
+│   (群机器人)     │                        │  (Extension)     │
+│                 │                        │                  │
 └─────────────────┘                        └──────────────────┘
-       │                                             │
-       │                                             │
-       ▼                                             ▼
-  企业微信用户                                    AI处理
-  (员工/客户)                                   (LLM + Tools)
+       │
+       │ 群聊用户接收消息
+       ▼
+   企业微信用户
 ```
 
 ### 核心模块
 
-- **WeComAPI** - 企业微信API封装（access_token管理、重试机制）
-- **TurnManager** - 消息任务管理（队列、并发、取消）
-- **ConfigManager** - 配置管理（持久化、配对）
-- **EventHandlers** - pi事件处理（session、agent、message生命周期）
+- **BotAPI** - 群机器人API封装
+- **MessageHandler** - 消息处理和分片
+- **Signature** - 加签密钥签名生成
+- **ConfigManager** - 配置管理
+
+## API参考
+
+### 消息类型
+
+```typescript
+// 发送文本
+await sendText("Hello World");
+
+// 发送Markdown
+await sendMarkdown("# 标题\n**粗体**\n- 列表");
+
+// 发送图片
+await sendImage(base64Data, md5Hash);
+
+// 发送图文卡片
+await sendNews(
+  "标题",
+  "描述内容",
+  "https://example.com",
+  "https://example.com/image.png"
+);
+
+// 发送文本卡片
+await sendTextCard(
+  "事件提醒",
+  "您有一个新任务需要处理",
+  "查看详情",
+  "https://example.com"
+);
+```
+
+### 配置接口
+
+```typescript
+interface WeComBotConfig {
+  webhookUrl?: string;  // Webhook URL（必需）
+  secret?: string;       // 加签密钥（可选）
+  enabled?: boolean;    // 是否启用
+}
+```
+
+## 常见问题
+
+### Q: 添加机器人时没有"群机器人"选项？
+A: 确保是企业微信专业版或个人版，部分功能需要管理员开启。
+
+### Q: 消息发送失败？
+A: 检查：
+1. Webhook URL 是否正确
+2. 机器人是否被移出群聊
+3. 群聊是否开启了"仅群主可发消息"
+
+### Q: 如何@群成员？
+A: 在消息中使用 `<@userid>` 格式，例如：
+```
+Hello <@user1> <@user2>，有新任务了
+```
 
 ## 开发
 
@@ -154,9 +190,9 @@ LLM会：
 ```
 pi-wecom/
 ├── index.ts          # 主入口
-├── package.json      # npm配置
-├── README.md         # 文档
-└── tsconfig.json     # TypeScript配置
+├── package.json     # npm配置
+├── README.md        # 文档
+└── .gitignore
 ```
 
 ### 本地开发
@@ -175,56 +211,6 @@ pi install ./
 # 测试运行
 pi -e ./
 ```
-
-### 类型检查
-
-```bash
-npx tsc --noEmit
-```
-
-## API参考
-
-### 配置接口
-
-```typescript
-interface WeComConfig {
-  corpId?: string;        // 企业ID
-  agentId?: string;       // 应用AgentID
-  corpSecret?: string;    // 应用Secret
-  webhookUrl?: string;    // 群机器人Webhook（可选）
-  allowedUserId?: string; // 允许的用户ID（配对后）
-  token?: string;         // 回调Token
-  aesKey?: string;        // 回调AES密钥
-}
-```
-
-### 可用方法
-
-```typescript
-// 发送文本消息
-await sendTextMessage(userId, content);
-
-// 发送Markdown
-await sendMarkdownMessage(userId, markdown);
-
-// 发送图文消息
-await sendNewsMessage(userId, [{
-  title: "标题",
-  description: "描述",
-  url: "https://...",
-  picurl: "https://..."
-}]);
-
-// 处理收到的消息
-await handleWeComMessage(userId, content, ctx);
-```
-
-## 注意事项
-
-1. **安全**：扩展只在配对的用户和企业微信应用之间转发消息
-2. **限流**：企业微信API有调用频率限制，扩展内置重试机制
-3. **Token**：access_token会自动刷新，扩展处理过期情况
-4. **附件**：单个附件建议不超过20MB，企业微信有限制
 
 ## License
 
