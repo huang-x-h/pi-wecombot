@@ -1,12 +1,12 @@
 {
-  "name": "@huang-x-h/pi-wecombot",
-  "version": "3.0.0",
+  "name": "pi-wecombot",
+  "version": "1.0.0",
   "type": "module",
   "description": "企业微信智能机器人 WebSocket 长连接扩展 for pi",
   "keywords": [
     "pi-package",
     "pi",
-    "wecom",
+    "wecombot",
     "企业微信",
     "websocket",
     "long-connection",
