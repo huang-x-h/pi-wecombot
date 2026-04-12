@@ -1,5 +1,5 @@
 {
-  "name": "@huang-x-h/pi-wecom",
+  "name": "@huang-x-h/pi-wecombot",
   "version": "3.0.0",
   "type": "module",
   "description": "企业微信智能机器人 WebSocket 长连接扩展 for pi",

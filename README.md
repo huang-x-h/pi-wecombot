@@ -1,30 +1,33 @@
-# wecombot
+# pi-wecombot
 
-> 企业微信智能机器人 WebSocket 长连接扩展 for pi
+> 企业微信群机器人长连接扩展 for pi
 
-使用官方 [aibot-node-sdk](https://developer.work.weixin.qq.com/document/path/101463) 实现。
+通过 WebSocket 长连接与企业微信机器人通信。
 
 ## 安装
 
 ```bash
-pi install git:github.com/huang-x-h/pi-wecom
+pi install git:github.com/huang-x-h/pi-wecombotbot
 ```
 
 ## 配置
 
-### 1. 获取凭证
+### 1. 添加群机器人
 
-在企业微信管理后台获取：
-- **BotID**: `wwxxxxxxxxxxxxxxx` 格式
-- **Secret**: 应用Secret
+```
+企业微信电脑客户端 → 打开任意群聊 → 群设置 → 群机器人 → 添加机器人
+```
 
-### 2. 在 pi 中配置
+### 2. 获取 Key
+
+复制机器人的 Key（Webhook URL 中的 key 参数）
+
+### 3. 在 pi 中配置
 
 ```
 /wecombot-setup
-# BotID: wwxxxxxxxxxxxxxxx
-# Secret: xxxxxxxxxxxxxxx
-# AgentID(可选): 
+# 输入机器人 Key
+# 加签密钥（可选）
 ```
 
 ## 命令
@@ -39,21 +42,21 @@ pi install git:github.com/huang-x-h/pi-wecom
 
 | 工具 | 说明 |
 |------|------|
-| `wecom_send` | 发送消息 |
+| `wecombot_send` | 发送消息 |
 | `wecombot_attach` | 发送文件 |
 
 ## 工作原理
 
 ```
-企业微信 ←── WebSocket ── aibot-sdk ── wecombot ── pi
-              │                            │
-              │                       AI处理
-              ◄──────────────────────────回复
+企业微信群 ←──WebSocket── wecombot ←── aibot-sdk
+     │                              │
+     │                         pi AI处理
+     ◄──────────────────────────回复
 ```
 
-## 参考
-
-- [企业微信智能机器人开发文档](https://developer.work.weixin.qq.com/document/path/101463)
+1. 用 Key 建立 WebSocket 长连接
+2. 群消息自动转发给 pi
+3. 回复自动发送到群聊
 
 ## License
 
