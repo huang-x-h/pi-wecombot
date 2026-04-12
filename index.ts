@@ -77,6 +77,7 @@ export default function (pi: ExtensionAPI) {
   let cfg: Config = {};
   let ws: WSClient | null = null;
   let connected = false;
+  let lastReqId = ""; // 记录最后一个 req_id 用于回复
 
   // 会话管理：reqId -> Session
   const sessions = new Map<string, Session>();
@@ -163,6 +164,7 @@ export default function (pi: ExtensionAPI) {
         chatId,
         timestamp: Date.now(),
       });
+      lastReqId = reqId; // 记录用于回复
 
       // 发送思考中...
       replyTo(reqId, "🤔 思考中...", false);
@@ -376,38 +378,23 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
 
-    // 从消息中提取 reqId
+    // 使用最后收到的 req_id 进行回复
+    if (!lastReqId || !sessions.has(lastReqId)) {
+      console.log("[wecom-bot] 无可回复的会话");
+      return;
+    }
+
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) return;
-    
+
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) return;
-
-    // 解析消息中的用户信息
-    const match = txt.match(/\[wecom-bot\] \[([^\]]+)\]/);
-    if (!match) return;
-
-    const userTag = match[1];
-    
-    // 找到对应的会话
-    let targetSession: Session | undefined;
-    for (const session of sessions.values()) {
-      const tag = session.userName || session.userId;
-      if (tag === userTag || userTag.includes(tag)) {
-        targetSession = session;
-        break;
-      }
-    }
 
     // 提取实际回复内容（去掉标签）
     const replyContent = txt.replace(/\[wecom-bot\] \[([^\]]+)\]\n?/g, "");
 
-    if (targetSession) {
-      // 回复到对应用户
-      replyTo(targetSession.frame.headers.req_id, replyContent, true);
-      console.log(`[wecom-bot] 回复 [${userTag}]: ${replyContent.slice(0, 30)}`);
-    } else {
-      console.log(`[wecom-bot] 未找到会话: ${userTag}`);
-    }
+    // 回复
+    replyTo(lastReqId, replyContent, true);
+    console.log(`[wecom-bot] 回复: ${replyContent.slice(0, 50)}`);
   });
 }
