@@ -1,15 +1,15 @@
 {
   "name": "@huang-x-h/pi-wecom",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "企业微信群机器人长连接 bridge extension for pi（使用官方 aibot-node-sdk）",
+  "description": "企业微信智能机器人 WebSocket 长连接扩展 for pi",
   "keywords": [
     "pi-package",
     "pi",
     "wecom",
     "企业微信",
-    "aibot",
     "websocket",
+    "long-connection",
     "extension"
   ],
   "license": "MIT",

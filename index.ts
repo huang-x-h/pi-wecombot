@@ -1,16 +1,17 @@
 /**
- * pi-wecombot
+ * wecombot
  * 
- * 企业微信群机器人长连接扩展 for pi
+ * 企业微信智能机器人 WebSocket 长连接扩展 for pi
+ * 使用官方 aibot-node-sdk
  * 
- * 使用官方 aibot-node-sdk 实现 WebSocket 长连接
- * https://developer.work.weixin.qq.com/document/path/101463
+ * 参考: https://developer.work.weixin.qq.com/document/path/101463
  */
 
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { AiBot } from "aibot-node-sdk";
+import { WSClient } from "aibot-node-sdk";
+import { generateReqId } from "aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -20,13 +21,15 @@ import { Type } from "@sinclair/typebox";
 // ============================================================================
 
 interface Config {
-  key?: string;
+  botId?: string;
   secret?: string;
+  agentId?: string;
   enabled?: boolean;
 }
 
 const CONFIG = join(homedir(), ".pi", "agent", "wecom-bot.json");
 const TEMP = join(homedir(), ".pi", "agent", "tmp", "wecom-bot");
+
 const PROMPT = `
 [wecom-bot] 企业微信机器人已连接
 - 收到 @机器人 的消息会自动处理
@@ -72,7 +75,7 @@ async function save(c: Config) {
 
 export default function (pi: ExtensionAPI) {
   let cfg: Config = {};
-  let bot: any = null;
+  let ws: WSClient | null = null;
   let connected = false;
 
   // Status bar
@@ -80,66 +83,96 @@ export default function (pi: ExtensionAPI) {
     const t = ctx.ui.theme;
     const tag = t.fg("accent", "🤖");
     if (msg) ctx.ui.setStatus("wecom", `${tag} ${t.fg("error", msg)}`);
-    else if (!cfg.key) ctx.ui.setStatus("wecom", `${tag} ${t.fg("muted", "未配置")}`);
+    else if (!cfg.botId) ctx.ui.setStatus("wecom", `${tag} ${t.fg("muted", "未配置")}`);
     else ctx.ui.setStatus("wecom", `${tag} ${t.fg(connected ? "success" : "warning", connected ? "✅" : "⚡")}`);
   }
 
   // Connect
   async function connect(ctx: ExtensionContext) {
-    if (!cfg.key) return;
+    if (!cfg.botId || !cfg.secret) return;
     disconnect();
 
-    console.log("[wecom] 连接中...");
-    bot = new AiBot({ key: cfg.key, secret: cfg.secret });
+    console.log("[wecom-bot] 连接中...");
 
-    bot.on("onStart", () => {
-      console.log("[wecom] ✅ 已连接");
+    ws = new WSClient({
+      botId: cfg.botId,
+      secret: cfg.secret,
+    });
+
+    ws.on("connected", () => {
+      console.log("[wecom-bot] ✅ WebSocket已连接");
       connected = true;
       setStatus(ctx);
     });
 
-    bot.on("onMessage", (msg: any) => {
-      const txt = msg.content || msg.text?.content || "";
-      if (!txt) return;
-      console.log("[wecom] 📥", txt.slice(0, 50));
-      pi.sendUserMessage([{ type: "text", text: `[wecom] ${txt}` }]);
+    ws.on("authenticated", () => {
+      console.log("[wecom-bot] ✅ 认证成功");
+      connected = true;
+      setStatus(ctx);
     });
 
-    bot.on("onClose", () => {
-      console.log("[wecom] ❌ 断开");
+    // 文本消息
+    ws.on("message.text", (frame: any) => {
+      const content = frame.body?.text?.content || "";
+      if (content) {
+        console.log("[wecom-bot] 收到:", content.slice(0, 50));
+        pi.sendUserMessage([{ type: "text", text: `[wecom-bot] ${content}` }]);
+      }
+    });
+
+    // 图片消息
+    ws.on("message.image", (frame: any) => {
+      const url = frame.body?.image?.url;
+      if (url) {
+        console.log("[wecom-bot] 收到图片:", url);
+      }
+    });
+
+    ws.on("disconnected", (reason) => {
+      console.log(`[wecom-bot] ❌ 断开: ${reason}`);
       connected = false;
       setStatus(ctx);
-      if (cfg.enabled) setTimeout(() => connect(ctx), 5000);
     });
 
-    bot.on("onError", (e: any) => {
-      console.log("[wecom] ❌", e?.message || e);
+    ws.on("error", (err) => {
+      console.log("[wecom-bot] ❌", err);
       connected = false;
-      setStatus(ctx, e?.message || "error");
+      setStatus(ctx, String(err));
     });
 
-    bot.start();
+    ws.connect();
   }
 
   function disconnect() {
-    if (bot) { bot.stop(); bot = null; }
+    if (ws) {
+      ws.disconnect();
+      ws = null;
+    }
     connected = false;
   }
 
-  // Send
-  async function send(txt: string) {
-    if (!bot) return;
-    for (const s of chunk(txt)) bot.sendText(s);
+  // Reply
+  function reply(content: string, isEnd = true) {
+    if (!ws || !connected) return;
+    // 存储最后一次消息用于回复
+    lastFrame = { body: { text: { content: "" } } };
+    lastStreamId = generateReqId("stream");
+    ws.reply(lastStreamId, content, isEnd);
   }
 
-  async function sendMd(md: string) {
-    if (!bot) return;
-    for (const s of chunk(md)) bot.sendMarkdown(s);
+  let lastFrame: any = null;
+  let lastStreamId = "";
+
+  function replyText(content: string, isEnd = true) {
+    if (!ws || !connected || !lastFrame) return;
+    const streamId = lastStreamId || generateReqId("stream");
+    ws.reply(streamId, content, isEnd);
   }
 
-  async function sendImg(b64: string, md5: string) {
-    if (!bot) return;
-    bot.sendImage(b64, md5);
+  function replyMarkdown(md: string, isEnd = true) {
+    if (!ws || !connected || !lastFrame) return;
+    const streamId = lastStreamId || generateReqId("stream");
+    ws.replyMarkdown(streamId, md, isEnd);
   }
 
   // ============================================================================
@@ -149,25 +182,27 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "wecombot_attach",
     label: "发送文件",
-    description: "发送本地文件到企业微信群",
+    description: "发送本地文件到企业微信",
     parameters: Type.Object({
       paths: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
     }),
     async execute(_id, p) {
+      if (!ws || !connected) {
+        throw new Error("机器人未连接");
+      }
+
       const files: string[] = [];
       for (const fp of p.paths) {
         if ((await stat(fp)).isFile()) files.push(fp);
       }
 
-      if (bot && files.length) {
-        for (const fp of files) {
-          const mt = ext(fp);
-          if (isImg(mt)) {
-            const buf = await readFile(fp);
-            await sendImg(buf.toString("base64"), buf.toString("hex").slice(0, 32));
-          } else {
-            await send(`📎 ${basename(fp)}`);
-          }
+      for (const fp of files) {
+        const mt = ext(fp);
+        if (isImg(mt)) {
+          const buf = await readFile(fp);
+          ws.sendImage(buf.toString("base64"), buf.toString("hex").slice(0, 32));
+        } else {
+          ws.sendText(`📎 ${basename(fp)}`);
         }
       }
 
@@ -176,9 +211,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "wecombot_send",
+    name: "wecom_send",
     label: "发送消息",
-    description: "发送消息到企业微信群",
+    description: "发送消息到企业微信",
     parameters: Type.Object({
       message: Type.String(),
       type: Type.Optional(Type.Union([
@@ -187,9 +222,9 @@ export default function (pi: ExtensionAPI) {
       ])),
     }),
     async execute(_id, p) {
-      if (!bot) throw new Error("机器人未连接");
-      if (p.type === "markdown") await sendMd(p.message);
-      else await send(p.message);
+      if (!ws || !connected) throw new Error("机器人未连接");
+      if (p.type === "markdown") ws.replyMarkdown("", p.message, true);
+      else ws.replyText(p.message, true);
       return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
     },
   });
@@ -201,11 +236,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("wecombot-setup", {
     description: "配置企业微信机器人",
     handler: async (_args, ctx) => {
-      const key = await ctx.ui.input("机器人 Key", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
-      if (!key) return;
+      const botId = await ctx.ui.input("BotID", "wwxxxxxxxxxxxxxxx");
+      if (!botId) return;
 
-      const secret = await ctx.ui.input("加签密钥(可选)", "");
-      cfg = { key: key.trim(), secret: secret?.trim() || undefined, enabled: true };
+      const secret = await ctx.ui.input("Secret", "");
+      if (!secret) return;
+
+      const agentId = await ctx.ui.input("AgentID(可选)", "");
+
+      cfg = {
+        botId: botId.trim(),
+        secret: secret.trim(),
+        agentId: agentId?.trim() || undefined,
+        enabled: true,
+      };
       await save(cfg);
       ctx.ui.notify("✅ 配置已保存", "success");
       await connect(ctx);
@@ -215,22 +259,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("wecombot-status", {
     description: "查看机器人状态",
     handler: async (_args, ctx) => {
-      if (!cfg.key) {
-        ctx.ui.notify("❌ 未配置", "warning");
-      } else {
-        ctx.ui.notify(`${connected ? "✅" : "⚡"} ${cfg.key.slice(0, 8)}...`, "info");
-      }
+      if (!cfg.botId) ctx.ui.notify("❌ 未配置", "warning");
+      else ctx.ui.notify(`${connected ? "✅" : "⚡"} ${cfg.botId.slice(0, 8)}...`, "info");
     },
   });
 
   pi.registerCommand("wecombot-test", {
     description: "发送测试消息",
     handler: async (_args, ctx) => {
-      if (!cfg.key) {
-        ctx.ui.notify("请先配置", "warning");
-        return;
-      }
-      await send(`🧪 ${new Date().toLocaleString("zh-CN")} | pi-wecombot`);
+      if (!ws || !connected) { ctx.ui.notify("请先配置", "warning"); return; }
+      ws.replyText(`🧪 ${new Date().toLocaleString("zh-CN")} | wecombot`, true);
       ctx.ui.notify("✅ 已发送", "success");
     },
   });
@@ -242,7 +280,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => {
     cfg = await load();
     await mkdir(TEMP, { recursive: true });
-    if (cfg.enabled && cfg.key) await connect(ctx);
+    if (cfg.enabled && cfg.botId && cfg.secret) await connect(ctx);
     setStatus(ctx);
   });
 
@@ -258,7 +296,12 @@ export default function (pi: ExtensionAPI) {
     if (!msg?.content) return;
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) return;
-    if (txt.includes("```") || txt.startsWith("#")) await sendMd(txt);
-    else await send(txt);
+    if (ws && connected) {
+      if (txt.includes("```") || txt.startsWith("#")) {
+        ws.replyMarkdown("", txt, true);
+      } else {
+        ws.replyText(txt, true);
+      }
+    }
   });
 }
