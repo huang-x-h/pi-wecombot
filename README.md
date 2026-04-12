@@ -14,6 +14,12 @@
 
 ## 安装
 
+### 通过 npm（推荐）
+```bash
+pi install npm:pi-wecombot
+```
+
+### 通过 Git
 ```bash
 pi install git:github.com/huang-x-h/pi-wecombot
 ```
