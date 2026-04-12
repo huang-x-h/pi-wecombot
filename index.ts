@@ -37,6 +37,13 @@ interface WeComApiResponse<T = unknown> {
   result?: T;
 }
 
+interface WeComTokenResponse {
+  errcode: number;
+  errmsg: string;
+  access_token?: string;
+  expires_in?: number;
+}
+
 interface WeComUser {
   userid: string;
   name: string;
@@ -276,17 +283,45 @@ export default function (pi: ExtensionAPI) {
       return accessToken;
     }
 
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${config.corpId}&corpsecret=${config.corpSecret}`;
-    const response = await fetch(url);
-    const data = (await response.json()) as WeComApiResponse;
-
-    if (data.errcode !== 0) {
-      throw new Error(`获取access_token失败: ${data.errmsg}`);
+    if (!config.corpId || !config.corpSecret) {
+      throw new Error("请先配置企业微信凭证：corpId 和 corpSecret");
     }
 
-    accessToken = data.result!.access_token;
-    tokenExpireTime = Date.now() + (data.result!.expires_in - 60) * 1000;
-    return accessToken;
+    const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${config.corpId}&corpsecret=${config.corpSecret}`;
+    
+    try {
+      const response = await fetch(url);
+      const data = (await response.json()) as WeComTokenResponse;
+
+      if (data.errcode !== 0) {
+        // 常见的错误码及说明
+        const errorMessages: Record<number, string> = {
+          40013: "CorpID无效，请检查CorpID是否正确",
+          40001: "Secret无效，请检查Secret是否正确",
+          40032: "Secret错误，请确认是企业应用的Secret而非通讯录Secret",
+          41002: "corpId或corpSecret为空",
+          42001: "access_token已过期",
+        };
+        
+        const knownError = errorMessages[data.errcode];
+        const errorDetail = knownError || `错误码: ${data.errcode}`;
+        throw new Error(`获取access_token失败: ${data.errmsg} (${errorDetail})`);
+      }
+
+      if (!data.access_token) {
+        throw new Error("获取access_token失败：返回数据无效");
+      }
+
+      accessToken = data.access_token;
+      tokenExpireTime = Date.now() + ((data.expires_in || 7200) - 60) * 1000;
+      console.log(`[wecom] access_token获取成功，有效期: ${data.expires_in || 7200}秒`);
+      return accessToken;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`获取access_token失败: ${String(error)}`);
+    }
   }
 
   async function callWeComApi<T>(
@@ -318,15 +353,17 @@ export default function (pi: ExtensionAPI) {
           });
           const retryData = (await retryResponse.json()) as WeComApiResponse<T>;
           if (retryData.errcode !== 0) {
-            throw new Error(retryData.errmsg);
+            throw new Error(`[${retryData.errcode}] ${retryData.errmsg}`);
           }
-          return retryData.result!;
+          // 企业微信API返回数据直接在根对象
+          return (retryData as unknown) as T;
         }
 
         if (data.errcode !== 0) {
-          throw new Error(data.errmsg);
+          throw new Error(`[${data.errcode}] ${data.errmsg}`);
         }
-        return data.result!;
+        // 企业微信API返回数据直接在根对象
+        return (data as unknown) as T;
       } catch (error) {
         if (attempt === retries - 1) throw error;
         await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
@@ -457,15 +494,24 @@ export default function (pi: ExtensionAPI) {
         corpSecret: corpSecret.trim(),
       };
 
-      // 测试获取access_token
+      // 测试获取access_token（临时使用新配置）
+      const tempAccessToken = accessToken;
+      const tempTokenExpireTime = tokenExpireTime;
+      const tempConfig = config;
+      
       try {
-        const token = await getAccessToken.call({
-          accessToken: undefined,
-          tokenExpireTime: 0,
-          config: nextConfig,
-        });
-        nextConfig.corpId = nextConfig.corpId;
+        // 临时替换为新配置进行测试
+        config = nextConfig;
+        accessToken = undefined; // 强制重新获取
+        
+        const token = await getAccessToken();
+        ctx.ui.notify(`Token获取成功: ${token.substring(0, 10)}...`, "info");
       } catch (error) {
+        // 恢复原配置
+        accessToken = tempAccessToken;
+        tokenExpireTime = tempTokenExpireTime;
+        config = tempConfig;
+        
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`配置验证失败: ${message}`, "error");
         return;
