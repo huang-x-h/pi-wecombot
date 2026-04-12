@@ -19,7 +19,7 @@
 ### 方式一：git安装（推荐）
 
 ```bash
-pi install git:github.com/badlogic/pi-wecom
+pi install git:github.com/huang-x-h/pi-wecom
 ```
 
 ### 方式二：本地开发
@@ -32,7 +32,7 @@ pi install ./pi-wecom
 ### 方式三：单次运行
 
 ```bash
-pi -e git:github.com/badlogic/pi-wecom
+pi -e git:github.com/huang-x-h/pi-wecom
 ```
 
 ## 配置
@@ -140,7 +140,7 @@ pi-wecom/
 
 ```bash
 # 克隆
-git clone https://github.com/badlogic/pi-wecom.git
+git clone https://github.com/huang-x-h/pi-wecom.git
 cd pi-wecom
 
 # 安装依赖
