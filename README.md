@@ -87,7 +87,7 @@ pi -e git:github.com/huang-x-h/pi-wecom
 
 | 工具 | 说明 |
 |------|------|
-| `telegram_attach` | 发送文件到群聊 |
+| `wecombot_attach` | 发送文件到群聊 |
 | `wecom_send` | 发送消息到群聊 |
 
 ### 使用示例

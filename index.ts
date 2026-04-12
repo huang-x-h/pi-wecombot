@@ -63,7 +63,7 @@ const SYSTEM_PROMPT_SUFFIX = `
 企业微信机器人桥接扩展已激活。
 - 所有通过企业微信机器人发送的消息都会标记 [wecom-bot]
 - 机器人在群聊中推送消息
-- 如果用户请求文件或生成的产物，调用 telegram_attach 工具将其发送到企业微信群`;
+- 如果用户请求文件或生成的产物，调用 wecombot_attach 工具将其发送到企业微信群`;
 
 // ============================================================================
 // Helper Functions
@@ -499,12 +499,12 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   pi.registerTool({
-    name: "telegram_attach",
+    name: "wecombot_attach",
     label: "WeCom Attach",
     description: "将本地文件通过企业微信机器人发送到群聊",
     promptSnippet: "将文件发送到企业微信群",
     promptGuidelines: [
-      "当用户请求发送文件或生成产物时，调用 telegram_attach 将文件发送到企业微信群",
+      "当用户请求发送文件或生成产物时，调用 wecombot_attach 将文件发送到企业微信群",
     ],
     parameters: Type.Object({
       paths: Type.Array(
