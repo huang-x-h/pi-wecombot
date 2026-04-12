@@ -66,7 +66,10 @@ function ext(name: string): string {
 function isImg(m: string): boolean { return m.startsWith("image/"); }
 
 async function load(): Promise<Config> {
-  try { return JSON.parse(await readFile(CONFIG, "utf8")); }
+  try {
+    const data = JSON.parse(await readFile(CONFIG, "utf8"));
+    return { bots: data.bots || [], activeBotId: data.activeBotId, enabled: data.enabled ?? true };
+  }
   catch { return { bots: [], enabled: true }; }
 }
 
@@ -84,7 +87,7 @@ function getActiveBot(cfg: Config): BotConfig | undefined {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-  let cfg: Config = { bots: [], enabled: true };
+  let cfg: Config = { bots: [], activeBotId: undefined, enabled: true };
   let ws: WSClient | null = null;
   let connected = false;
   let lastReqId = "";
@@ -249,6 +252,7 @@ export default function (pi: ExtensionAPI) {
       const secret = await ctx.ui.input("Secret", "");
       if (!secret) return;
 
+      cfg.bots = cfg.bots || [];
       cfg.bots.push({ botId: botId.trim(), secret: secret.trim(), name: name?.trim() || undefined });
       if (!cfg.activeBotId) cfg.activeBotId = botId.trim();
       cfg.enabled = true;
