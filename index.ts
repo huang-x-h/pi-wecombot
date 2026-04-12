@@ -243,7 +243,7 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   pi.registerTool({
-    name: "wecombot_attach",
+    name: "wecombot-attach",
     label: "发送文件",
     description: "发送本地文件到企业微信",
     parameters: Type.Object({
@@ -279,7 +279,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "wecom_send",
+    name: "wecombot-send",
     label: "发送消息",
     description: "发送消息到企业微信",
     parameters: Type.Object({

@@ -49,8 +49,8 @@ pi install git:github.com/huang-x-h/pi-wecombot
 
 | 工具 | 说明 |
 |------|------|
-| `wecom_send` | 发送消息到企业微信 |
-| `wecombot_attach` | 发送文件到企业微信 |
+| `wecombot-send` | 发送消息到企业微信 |
+| `wecombot-attach` | 发送文件到企业微信 |
 
 ## 会话管理
 
