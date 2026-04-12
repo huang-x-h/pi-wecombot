@@ -1,8 +1,8 @@
 {
   "name": "@huang-x-h/pi-wecom",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "企业微信群机器人(Webhook) bridge extension for pi",
+  "description": "企业微信群机器人(Webhook + 长连接) bridge extension for pi",
   "keywords": [
     "pi-package",
     "pi",
@@ -11,6 +11,8 @@
     "企业微信",
     "企业微信机器人",
     "webhook",
+    "websocket",
+    "long-connection",
     "chatbot",
     "extension"
   ],
@@ -31,5 +33,8 @@
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
   }
 }

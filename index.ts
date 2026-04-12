@@ -1,21 +1,20 @@
 /**
  * pi-wecom-bot
  * 
- * 企业微信智能机器人(Webhook) DM bridge for pi
+ * 企业微信群机器人(Webhook) DM bridge for pi
  * 
- * 基于企业微信群机器人Webhook接口实现
+ * 支持两种模式：
+ * 1. Webhook模式：直接POST发送消息到群聊
+ * 2. 长连接模式：通过WebSocket与企业微信服务器保持连接
+ * 
  * 参考: https://open.work.weixin.qq.com/help2/pc/cat?doc_id=21657
- * 
- * 特点：
- * - 无需企业ID和Secret，仅需Webhook URL
- * - 支持文本、Markdown、图片、文件等消息
- * - 支持加签密钥验证
  */
 
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { createHmac, randomUUID } from "node:crypto";
+import { WebSocket } from "node:ws";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -27,14 +26,37 @@ import { Type } from "@sinclair/typebox";
 // ============================================================================
 
 interface WeComBotConfig {
-  webhookUrl?: string;      // Webhook URL（必需）
-  secret?: string;          // 加签密钥（可选）
+  webhookUrl?: string;      // Webhook URL（基础模式）
+  secret?: string;          // 加签密钥
   enabled?: boolean;        // 是否启用
+  
+  // 长连接模式配置
+  longConnection?: {
+    enabled: boolean;       // 是否启用长连接
+    wssUrl?: string;       // WebSocket连接URL
+  };
+  
+  // 消息处理
+  onMessage?: (message: WeComRobotMessage) => void;
 }
 
 interface WeComApiResponse {
   errcode: number;
   errmsg: string;
+}
+
+interface WeComRobotMessage {
+  msgId: string;
+  robotCode: string;
+  openChatId: string;
+  openRobotId: string;
+  openAppId: string;
+  chatType: string;
+  msgType: string;
+  content: string;
+  fromUserName?: string;
+  createTime: number;
+  scene?: number;
 }
 
 interface PendingMessage {
@@ -54,10 +76,12 @@ interface QueuedAttachment {
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "wecom-bot.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "wecom-bot");
 const WECOM_BOT_PREFIX = "[wecom-bot]";
-const MAX_MESSAGE_LENGTH = 4096; // 企业微信机器人消息长度限制
+const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 
-// 系统提示词
+// 企业微信长连接网关
+const WSS_BASE_URL = "wss://qyapi.weixin.qq.com/wvp/";
+
 const SYSTEM_PROMPT_SUFFIX = `
 
 企业微信机器人桥接扩展已激活。
@@ -77,88 +101,43 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
-/**
- * 根据文件扩展名猜测MIME类型
- */
 function guessMimeType(fileName: string): string {
   const ext = fileName.toLowerCase().split(".").pop();
   const mimeTypes: Record<string, string> = {
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "gif": "image/gif",
-    "bmp": "image/bmp",
-    "webp": "image/webp",
-    "mp4": "video/mp4",
-    "avi": "video/avi",
-    "mov": "video/quicktime",
-    "mp3": "audio/mpeg",
-    "wav": "audio/wav",
-    "ogg": "audio/ogg",
-    "pdf": "application/pdf",
-    "doc": "application/msword",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "xls": "application/vnd.ms-excel",
-    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "ppt": "application/vnd.ms-powerpoint",
-    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "zip": "application/zip",
-    "rar": "application/x-rar-compressed",
-    "txt": "text/plain",
-    "json": "application/json",
-    "xml": "text/xml",
-    "html": "text/html",
-    "css": "text/css",
-    "js": "application/javascript",
-    "ts": "text/typescript",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+    "mp4": "video/mp4", "mp3": "audio/mpeg", "pdf": "application/pdf",
+    "txt": "text/plain", "json": "application/json",
   };
   return mimeTypes[ext || ""] || "application/octet-stream";
 }
 
-/**
- * 判断是否为图片类型
- */
 function isImageType(mimeType: string): boolean {
   return mimeType.startsWith("image/");
 }
 
-/**
- * 格式化文件大小
- */
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
-/**
- * 生成签名（用于加签密钥验证）
- */
 function generateSignature(secret: string, timestamp: string): string {
   const stringToSign = `${timestamp}\n${secret}`;
   return createHmac("sha256", secret).update(stringToSign, "utf8").digest("base64");
 }
 
-/**
- * 文本分片
- */
 function chunkText(text: string): string[] {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text];
-
+  
   const paragraphs = text.split(/\n\n+/);
   const chunks: string[] = [];
   let current = "";
 
   const flushCurrent = (): void => {
-    if (current.trim().length > 0) chunks.push(current);
+    if (current.trim()) chunks.push(current);
     current = "";
   };
 
   for (const paragraph of paragraphs) {
-    if (paragraph.length === 0) continue;
+    if (!paragraph) continue;
     
     if (paragraph.length <= MAX_MESSAGE_LENGTH) {
-      const candidate = current.length === 0 ? paragraph : `${current}\n\n${paragraph}`;
+      const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
       if (candidate.length <= MAX_MESSAGE_LENGTH) {
         current = candidate;
       } else {
@@ -167,24 +146,11 @@ function chunkText(text: string): string[] {
       }
     } else {
       flushCurrent();
-      // 超长段落按行分割
-      const lines = paragraph.split("\n");
-      let lineBuffer = "";
-      
-      for (const line of lines) {
-        const newBuffer = lineBuffer.length === 0 ? line : `${lineBuffer}\n${line}`;
-        if (newBuffer.length <= MAX_MESSAGE_LENGTH) {
-          lineBuffer = newBuffer;
-        } else {
-          if (lineBuffer) chunks.push(lineBuffer);
-          lineBuffer = line.length <= MAX_MESSAGE_LENGTH ? line : "";
-        }
+      for (let i = 0; i < paragraph.length; i += MAX_MESSAGE_LENGTH) {
+        chunks.push(paragraph.slice(i, i + MAX_MESSAGE_LENGTH));
       }
-      
-      if (lineBuffer) chunks.push(lineBuffer);
     }
   }
-
   flushCurrent();
   return chunks;
 }
@@ -213,6 +179,8 @@ async function writeConfig(config: WeComBotConfig): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
   let config: WeComBotConfig = {};
+  let wsConnection: WebSocket | null = null;
+  let reconnectTimer: NodeJS.Timeout | null = null;
   let queuedMessages: PendingMessage[] = [];
   let activeMessage: PendingMessage | undefined;
   let setupInProgress = false;
@@ -235,153 +203,237 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     
+    const connectionStatus = config.longConnection?.enabled
+      ? (wsConnection?.readyState === WebSocket.OPEN ? "🔌" : "⚡")
+      : "📤";
+    
     if (!config.enabled) {
       ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("warning", "disabled")}`);
       return;
     }
     
-    ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("success", "ready")}`);
+    ctx.ui.setStatus("wecom-bot", `${label} ${theme.fg("success", connectionStatus + " ready")}`);
   }
 
   // ============================================================================
-  // WeCom Bot API
+  // WebSocket Long Connection (长连接模式)
   // ============================================================================
 
   /**
-   * 发送消息到企业微信群
+   * 启动长连接
    */
-  async function sendMessage(message: Record<string, unknown>): Promise<void> {
+  async function startLongConnection(ctx: ExtensionContext): Promise<void> {
+    if (!config.webhookUrl || !config.longConnection?.enabled) {
+      return;
+    }
+
+    // 从webhook URL提取token
+    const url = new URL(config.webhookUrl);
+    const token = url.searchParams.get("key");
+    
+    if (!token) {
+      console.log("[wecom-bot] 长连接模式需要有效的webhook key");
+      return;
+    }
+
+    const wssUrl = `${WSS_BASE_URL}session/longconnection?key=${token}&passback=pi-wecom`;
+
+    console.log("[wecom-bot] 正在建立长连接...");
+    
+    try {
+      wsConnection = new WebSocket(wssUrl);
+      
+      wsConnection.on("open", () => {
+        console.log("[wecom-bot] ✅ 长连接已建立");
+        updateStatus(ctx);
+      });
+
+      wsConnection.on("message", (data) => {
+        try {
+          const message = JSON.parse(data.toString());
+          handleIncomingMessage(message, ctx);
+        } catch (e) {
+          console.log("[wecom-bot] 解析消息失败:", e);
+        }
+      });
+
+      wsConnection.on("close", (code, reason) => {
+        console.log(`[wecom-bot] 长连接断开: ${code} ${reason}`);
+        wsConnection = null;
+        
+        // 自动重连
+        if (config.enabled && config.longConnection?.enabled) {
+          scheduleReconnect(ctx);
+        }
+      });
+
+      wsConnection.on("error", (error) => {
+        console.log("[wecom-bot] 长连接错误:", error.message);
+        updateStatus(ctx, error.message);
+      });
+
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.log("[wecom-bot] 建立长连接失败:", msg);
+      scheduleReconnect(ctx);
+    }
+  }
+
+  /**
+   * 调度重连
+   */
+  function scheduleReconnect(ctx: ExtensionContext): void {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+    }
+    
+    reconnectTimer = setTimeout(() => {
+      if (config.enabled && config.longConnection?.enabled) {
+        console.log("[wecom-bot] 尝试重新连接...");
+        startLongConnection(ctx);
+      }
+    }, 5000);
+  }
+
+  /**
+   * 停止长连接
+   */
+  function stopLongConnection(): void {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    
+    if (wsConnection) {
+      wsConnection.close(1000, "正常关闭");
+      wsConnection = null;
+    }
+  }
+
+  /**
+   * 通过长连接发送消息
+   */
+  function sendViaLongConnection(message: Record<string, unknown>): boolean {
+    if (!wsConnection || wsConnection.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    try {
+      wsConnection.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      console.log("[wecom-bot] 长连接发送失败:", error);
+      return false;
+    }
+  }
+
+  /**
+   * 处理收到的消息
+   */
+  function handleIncomingMessage(message: any, ctx: ExtensionContext): void {
+    console.log("[wecom-bot] 收到消息:", JSON.stringify(message).substring(0, 200));
+
+    // 解析消息
+    const msg: WeComRobotMessage = {
+      msgId: message.msgid || randomUUID(),
+      robotCode: message.robot_code || "",
+      openChatId: message.open_chat_id || "",
+      openRobotId: message.open_robot_id || "",
+      openAppId: message.open_appid || "",
+      chatType: message.chat_type || "group",
+      msgType: message.msg_type || "text",
+      content: message.content || message.text?.content || "",
+      createTime: message.create_time || Math.floor(Date.now() / 1000),
+    };
+
+    // 触发回调
+    if (config.onMessage) {
+      config.onMessage(msg);
+    }
+  }
+
+  // ============================================================================
+  // Webhook Mode (Webhook模式)
+  // ============================================================================
+
+  async function sendViaWebhook(message: Record<string, unknown>): Promise<void> {
     if (!config.webhookUrl) {
       throw new Error("请先配置企业微信机器人 Webhook URL");
     }
 
     let url = config.webhookUrl;
     
-    // 如果配置了加签密钥，添加签名
     if (config.secret) {
       const timestamp = Math.floor(Date.now() / 1000).toString();
       const sign = generateSignature(config.secret, timestamp);
-      const separator = url.includes("?") ? "&" : "?";
-      url = `${url}${separator}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+      url = `${url}${url.includes("?") ? "&" : "?"}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
     }
 
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(message),
-      });
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
 
-      const data = (await response.json()) as WeComApiResponse;
-
-      if (data.errcode !== 0) {
-        throw new Error(`发送失败 [${data.errcode}]: ${data.errmsg}`);
-      }
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(`发送失败: ${String(error)}`);
+    const data = (await response.json()) as WeComApiResponse;
+    if (data.errcode !== 0) {
+      throw new Error(`发送失败 [${data.errcode}]: ${data.errmsg}`);
     }
   }
 
-  /**
-   * 发送文本消息
-   */
+  // ============================================================================
+  // Message Sending
+  // ============================================================================
+
+  async function sendMessage(message: Record<string, unknown>): Promise<void> {
+    // 优先使用长连接
+    if (config.longConnection?.enabled && sendViaLongConnection(message)) {
+      console.log("[wecom-bot] 通过长连接发送");
+      return;
+    }
+    
+    // 回退到Webhook
+    await sendViaWebhook(message);
+  }
+
   async function sendText(text: string): Promise<void> {
     const chunks = chunkText(text);
     for (const chunk of chunks) {
       await sendMessage({
         msgtype: "text",
-        text: {
-          content: chunk,
-        },
+        text: { content: chunk },
       });
     }
   }
 
-  /**
-   * 发送Markdown消息
-   */
   async function sendMarkdown(content: string): Promise<void> {
     const chunks = chunkText(content);
     for (const chunk of chunks) {
       await sendMessage({
         msgtype: "markdown",
-        markdown: {
-          content: chunk,
-        },
+        markdown: { content: chunk },
       });
     }
   }
 
-  /**
-   * 发送图片（base64格式）
-   */
   async function sendImage(base64Data: string, md5: string): Promise<void> {
     await sendMessage({
       msgtype: "image",
-      image: {
-        base64: base64Data,
-        md5: md5,
-      },
+      image: { base64: base64Data, md5 },
     });
   }
 
-  /**
-   * 发送图文消息（链接卡片）
-   */
-  async function sendNews(
-    title: string,
-    description: string,
-    url: string,
-    picUrl?: string
-  ): Promise<void> {
+  async function sendNews(title: string, description: string, url: string, picUrl?: string): Promise<void> {
     await sendMessage({
       msgtype: "news",
       news: {
-        articles: [
-          {
-            title,
-            description,
-            url,
-            picurl: picUrl || "",
-          },
-        ],
+        articles: [{ title, description, url, picurl: picUrl || "" }],
       },
     });
   }
 
-  /**
-   * 发送文件（通过media_id，需要先上传素材）
-   * 注意：机器人文件消息需要先将文件上传为临时素材
-   */
   async function sendFile(filePath: string): Promise<void> {
-    // 企业微信群机器人暂时不支持直接发送文件
-    // 建议使用图文消息或提示用户下载链接
-    await sendText(`📎 文件: ${basename(filePath)}\n请查看附件或访问相关链接`);
-  }
-
-  /**
-   * 发送纯文本消息（富文本卡片）
-   */
-  async function sendTextCard(
-    title: string,
-    description: string,
-    btnText?: string,
-    btnUrl?: string
-  ): Promise<void> {
-    const message: Record<string, unknown> = {
-      msgtype: "textcard",
-      textcard: {
-        title,
-        description,
-        url: btnUrl || "https://work.weixin.qq.com/",
-        btntxt: btnText || "更多",
-      },
-    };
-
-    await sendMessage(message);
+    await sendText(`📎 文件: ${basename(filePath)}`);
   }
 
   // ============================================================================
@@ -400,23 +452,35 @@ export default function (pi: ExtensionAPI) {
       );
       if (!webhookUrl) return;
 
-      // 2. 获取加签密钥（可选）
-      const secret = await ctx.ui.input(
-        "加签密钥（可选，直接回车跳过）",
-        ""
-      );
+      // 2. 选择连接模式
+      const connectionMode = await ctx.ui.select("选择连接模式:", [
+        "webhook-only",
+        "long-connection",
+      ]);
 
-      // 3. 验证配置
+      // 3. 获取加签密钥（可选）
+      const secret = await ctx.ui.input("加签密钥（可选）", "");
+
+      // 4. 配置
       const nextConfig: WeComBotConfig = {
         webhookUrl: webhookUrl.trim(),
         secret: secret.trim() || undefined,
         enabled: true,
+        longConnection: {
+          enabled: connectionMode === "long-connection",
+        },
       };
 
       // 测试发送
       try {
-        await sendText("🔔 pi-wecom-bot 连接测试\n\n配置成功！机器人已准备就绪。");
+        await sendText("🔔 pi-wecom-bot 连接测试\n\n配置成功！");
         ctx.ui.notify("✅ Webhook 连接成功！", "success");
+        
+        if (nextConfig.longConnection?.enabled) {
+          // 启动长连接
+          await startLongConnection(ctx);
+          ctx.ui.notify("✅ 长连接已建立", "success");
+        }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`❌ 连接失败: ${msg}`, "error");
@@ -460,17 +524,11 @@ export default function (pi: ExtensionAPI) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i] as unknown as Record<string, unknown>;
       if (message.role !== "assistant") continue;
-      const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
-      const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
-      const content = Array.isArray(message.content) ? message.content : [];
-      const text = content
-        .filter((block): block is { type: string; text?: string } =>
-          typeof block === "object" && block !== null && "type" in block)
-        .filter((block) => block.type === "text" && typeof block.text === "string")
-        .map((block) => block.text as string)
-        .join("")
-        .trim();
-      return { text: text || undefined, stopReason, errorMessage };
+      return {
+        text: (message.content as any[])?.find((b: any) => b.type === "text")?.text || "",
+        stopReason: message.stopReason as string,
+        errorMessage: message.errorMessage as string,
+      };
     }
     return {};
   }
@@ -478,18 +536,9 @@ export default function (pi: ExtensionAPI) {
   async function processAndSendMessage(text: string): Promise<void> {
     if (!text) return;
 
-    // 判断消息类型
-    if (text.includes("```")) {
-      // 代码块较多，使用Markdown
-      await sendMarkdown(text);
-    } else if (text.startsWith("#") || text.includes("**")) {
-      // Markdown格式
-      await sendMarkdown(text);
-    } else if (text.includes("\n")) {
-      // 多行文本
+    if (text.includes("```") || text.startsWith("#") || text.includes("**")) {
       await sendMarkdown(text);
     } else {
-      // 普通文本
       await sendText(text);
     }
   }
@@ -520,11 +569,9 @@ export default function (pi: ExtensionAPI) {
         if (!stats.isFile()) {
           throw new Error(`不是文件: ${inputPath}`);
         }
-
         added.push(inputPath);
       }
 
-      // 如果有活动消息，直接发送
       if (activeMessage) {
         for (const filePath of added) {
           const mimeType = guessMimeType(filePath);
@@ -540,12 +587,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `已加入 ${added.length} 个附件到发送队列。`,
-          },
-        ],
+        content: [{ type: "text", text: `已加入 ${added.length} 个附件到发送队列。` }],
         details: { paths: added },
       };
     },
@@ -557,36 +599,23 @@ export default function (pi: ExtensionAPI) {
     description: "直接发送消息到企业微信群",
     parameters: Type.Object({
       message: Type.String({ description: "要发送的消息内容" }),
-      type: Type.Optional(
-        Type.Union([
-          Type.Literal("text"),
-          Type.Literal("markdown"),
-        ])
-      ),
+      type: Type.Optional(Type.Union([
+        Type.Literal("text"),
+        Type.Literal("markdown"),
+      ])),
     }),
     async execute(_toolCallId, params) {
       if (!config.webhookUrl) {
         throw new Error("请先运行 /wecom-bot-setup 配置机器人");
       }
 
-      const type = params.type || "text";
-
       try {
-        if (type === "markdown") {
+        if (params.type === "markdown") {
           await sendMarkdown(params.message);
         } else {
           await sendText(params.message);
         }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `✅ 消息已发送（${type}）`,
-            },
-          ],
-          details: {},
-        };
+        return { content: [{ type: "text", text: "✅ 消息已发送" }], details: {} };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         throw new Error(`发送失败: ${msg}`);
@@ -599,7 +628,7 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   pi.registerCommand("wecom-bot-setup", {
-    description: "配置企业微信群机器人 Webhook",
+    description: "配置企业微信群机器人（支持Webhook/长连接）",
     handler: async (_args, ctx) => {
       await promptForConfig(ctx);
     },
@@ -609,30 +638,31 @@ export default function (pi: ExtensionAPI) {
     description: "查看企业微信机器人状态",
     handler: async (_args, ctx) => {
       if (config.webhookUrl) {
-        const urlParts = config.webhookUrl.split("/");
-        const keyPart = urlParts[urlParts.length - 1] || "";
-        const keyId = keyPart.replace("key=", "").substring(0, 10);
+        const keyPart = config.webhookUrl.split("/").pop() || "";
+        const keyId = keyPart.replace("key=", "").substring(0, 8);
+        
+        const mode = config.longConnection?.enabled ? "🔌长连接" : "📤Webhook";
+        const status = wsConnection?.readyState === WebSocket.OPEN ? "✅已连接" : "⚡未连接";
         
         ctx.ui.notify(
-          `状态: ${config.enabled ? "✅ 已启用" : "❌ 已禁用"} | Key: ${keyId}... | 加密: ${config.secret ? "✅ 是" : "❌ 否"}`,
+          `${mode} | Key: ${keyId}... | ${status} | 加密: ${config.secret ? "✅" : "❌"}`,
           "info"
         );
       } else {
-        ctx.ui.notify("状态: ❌ 未配置，运行 /wecom-bot-setup 进行配置", "warning");
+        ctx.ui.notify("状态: ❌ 未配置", "warning");
       }
     },
   });
 
   pi.registerCommand("wecom-bot-test", {
-    description: "发送测试消息到企业微信群",
+    description: "发送测试消息",
     handler: async (_args, ctx) => {
       if (!config.webhookUrl) {
-        ctx.ui.notify("请先运行 /wecom-bot-setup 配置机器人", "warning");
+        ctx.ui.notify("请先配置机器人", "warning");
         return;
       }
-
       try {
-        await sendText("🧪 测试消息\n\n来自 pi-wecom-bot 的测试消息");
+        await sendText(`🧪 测试消息\n\n来自 pi-wecom-bot\n时间: ${new Date().toLocaleString("zh-CN")}`);
         ctx.ui.notify("✅ 测试消息已发送", "success");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -642,22 +672,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("wecom-bot-enable", {
-    description: "启用企业微信机器人",
+    description: "启用机器人",
     handler: async (_args, ctx) => {
-      if (!config.webhookUrl) {
-        ctx.ui.notify("请先运行 /wecom-bot-setup 配置机器人", "warning");
-        return;
-      }
       config.enabled = true;
       await writeConfig(config);
+      if (config.longConnection?.enabled) {
+        await startLongConnection(ctx);
+      }
       ctx.ui.notify("✅ 机器人已启用", "success");
       updateStatus(ctx);
     },
   });
 
   pi.registerCommand("wecom-bot-disable", {
-    description: "禁用企业微信机器人",
+    description: "禁用机器人",
     handler: async (_args, ctx) => {
+      stopLongConnection();
       config.enabled = false;
       await writeConfig(config);
       ctx.ui.notify("✅ 机器人已禁用", "info");
@@ -672,21 +702,25 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     config = await readConfig();
     await mkdir(TEMP_DIR, { recursive: true });
+    
+    if (config.enabled && config.longConnection?.enabled) {
+      await startLongConnection(ctx);
+    }
+    
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
+    stopLongConnection();
     queuedMessages = [];
     activeMessage = undefined;
   });
 
   pi.on("before_agent_start", async (event) => {
     const suffix = isWeComBotPrompt(event.prompt)
-      ? `${SYSTEM_PROMPT_SUFFIX}\n- 当前消息来自企业微信群机器人。`
+      ? `${SYSTEM_PROMPT_SUFFIX}\n- 当前消息来自企业微信群。`
       : SYSTEM_PROMPT_SUFFIX;
-    return {
-      systemPrompt: event.systemPrompt + suffix,
-    };
+    return { systemPrompt: event.systemPrompt + suffix };
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -702,31 +736,24 @@ export default function (pi: ExtensionAPI) {
 
     const assistant = extractAssistantText(event.messages);
 
-    if (assistant.stopReason === "aborted") {
-      return;
-    }
-
+    if (assistant.stopReason === "aborted") return;
     if (assistant.stopReason === "error") {
-      await sendText(`❌ 处理失败\n\n${assistant.errorMessage || "未知错误"}`);
+      await sendText(`❌ 处理失败\n\n${assistant.errorMessage}`);
       return;
     }
-
     if (assistant.text) {
       await processAndSendMessage(assistant.text);
     }
   });
-
-  // ============================================================================
-  // Public API
-  // ============================================================================
 
   return {
     sendText,
     sendMarkdown,
     sendImage,
     sendNews,
-    sendTextCard,
     config,
+    startLongConnection,
+    stopLongConnection,
     updateStatus,
   };
 }
