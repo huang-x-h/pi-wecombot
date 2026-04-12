@@ -10,8 +10,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { WSClient } from "aibot-node-sdk";
-import { generateReqId } from "aibot-node-sdk";
+import { WSClient, generateReqId } from "aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -77,6 +76,8 @@ export default function (pi: ExtensionAPI) {
   let cfg: Config = {};
   let ws: WSClient | null = null;
   let connected = false;
+  let lastFrame: any = null;
+  let lastStreamId = "";
 
   // Status bar
   function setStatus(ctx: ExtensionContext, msg?: string) {
@@ -116,6 +117,8 @@ export default function (pi: ExtensionAPI) {
       const content = frame.body?.text?.content || "";
       if (content) {
         console.log("[wecom-bot] 收到:", content.slice(0, 50));
+        lastFrame = frame;
+        lastStreamId = generateReqId("stream");
         pi.sendUserMessage([{ type: "text", text: `[wecom-bot] ${content}` }]);
       }
     });
@@ -149,30 +152,16 @@ export default function (pi: ExtensionAPI) {
       ws = null;
     }
     connected = false;
+    lastFrame = null;
   }
 
-  // Reply
-  function reply(content: string, isEnd = true) {
-    if (!ws || !connected) return;
-    // 存储最后一次消息用于回复
-    lastFrame = { body: { text: { content: "" } } };
-    lastStreamId = generateReqId("stream");
-    ws.reply(lastStreamId, content, isEnd);
-  }
-
-  let lastFrame: any = null;
-  let lastStreamId = "";
-
-  function replyText(content: string, isEnd = true) {
-    if (!ws || !connected || !lastFrame) return;
-    const streamId = lastStreamId || generateReqId("stream");
-    ws.reply(streamId, content, isEnd);
-  }
-
-  function replyMarkdown(md: string, isEnd = true) {
-    if (!ws || !connected || !lastFrame) return;
-    const streamId = lastStreamId || generateReqId("stream");
-    ws.replyMarkdown(streamId, md, isEnd);
+  // Reply - 使用 replyStream
+  function sendReply(content: string, isEnd = true) {
+    if (!ws || !connected || !lastFrame) {
+      console.log("[wecom-bot] 无法回复: 未连接或无上下文");
+      return;
+    }
+    ws.replyStream(lastFrame, lastStreamId, content, isEnd);
   }
 
   // ============================================================================
@@ -200,9 +189,15 @@ export default function (pi: ExtensionAPI) {
         const mt = ext(fp);
         if (isImg(mt)) {
           const buf = await readFile(fp);
-          ws.sendImage(buf.toString("base64"), buf.toString("hex").slice(0, 32));
+          // 使用主动发送媒体
+          ws.sendMediaMessage(lastFrame?.body?.from_info?.userid || "", "image", buf.toString("base64"), {
+            md5: buf.toString("hex").slice(0, 32),
+          });
         } else {
-          ws.sendText(`📎 ${basename(fp)}`);
+          // 先发送文本
+          if (lastFrame) {
+            sendReply(`📎 ${basename(fp)}`);
+          }
         }
       }
 
@@ -223,8 +218,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, p) {
       if (!ws || !connected) throw new Error("机器人未连接");
-      if (p.type === "markdown") ws.replyMarkdown("", p.message, true);
-      else ws.replyText(p.message, true);
+      
+      if (lastFrame) {
+        // 回复到触发消息的会话
+        sendReply(p.message, true);
+      } else {
+        throw new Error("无可用会话上下文");
+      }
+      
       return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
     },
   });
@@ -268,8 +269,8 @@ export default function (pi: ExtensionAPI) {
     description: "发送测试消息",
     handler: async (_args, ctx) => {
       if (!ws || !connected) { ctx.ui.notify("请先配置", "warning"); return; }
-      ws.replyText(`🧪 ${new Date().toLocaleString("zh-CN")} | wecombot`, true);
-      ctx.ui.notify("✅ 已发送", "success");
+      // 发送测试需要先收到消息
+      ctx.ui.notify("⚠️ 请先 @机器人 发送消息", "warning");
     },
   });
 
@@ -292,16 +293,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
+    
+    if (!lastFrame || !ws || !connected) {
+      console.log("[wecom-bot] 无上下文，跳过回复");
+      return;
+    }
+
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) return;
+    
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) return;
-    if (ws && connected) {
-      if (txt.includes("```") || txt.startsWith("#")) {
-        ws.replyMarkdown("", txt, true);
-      } else {
-        ws.replyText(txt, true);
-      }
-    }
+
+    // 使用 replyStream 发送回复
+    sendReply(txt, true);
   });
 }
