@@ -10,7 +10,6 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
 import Aibot from "aibot-node-sdk";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -19,18 +18,13 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 
 // ============================================================================
-// Type Definitions
+// Types
 // ============================================================================
 
-interface WeComBotConfig {
-  webhookUrl?: string;
+interface BotConfig {
+  key?: string;
   secret?: string;
   enabled?: boolean;
-}
-
-interface QueuedAttachment {
-  path: string;
-  fileName: string;
 }
 
 // ============================================================================
@@ -39,367 +33,227 @@ interface QueuedAttachment {
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "wecom-bot.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "wecom-bot");
-const MAX_MESSAGE_LENGTH = 4096;
-const MAX_ATTACHMENTS = 10;
+const MAX_MSG = 4096;
+const MAX_FILES = 10;
 
-const SYSTEM_PROMPT = `
-企业微信机器人桥接扩展已激活。
-- 所有通过企业微信机器人发送的消息都会标记 [wecom-bot]
-- 机器人在群聊中推送消息
-- 如果用户请求文件或生成的产物，调用 wecombot_attach 工具将其发送到企业微信群`;
+const PROMPT = `
+企业微信机器人桥接已激活 [wecom-bot]。
+- 收到群消息会自动转发给 pi 处理
+- 回复会自动发送到群聊
+- 使用 wecombot_attach 发送文件`;
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-function guessMimeType(name: string): string {
-  const ext = name.toLowerCase().split(".").pop();
-  const map: Record<string, string> = {
+function mimeType(name: string): string {
+  const e = name.split(".").pop()?.toLowerCase();
+  const m: Record<string, string> = {
     jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
     gif: "image/gif", webp: "image/webp", mp4: "video/mp4",
-    mp3: "audio/mpeg", pdf: "application/pdf",
-    txt: "text/plain", json: "application/json",
+    mp3: "audio/mpeg", pdf: "application/pdf", txt: "text/plain",
   };
-  return map[ext || ""] || "application/octet-stream";
+  return m[e || ""] || "application/octet-stream";
 }
 
-function isImage(mime: string): boolean {
-  return mime.startsWith("image/");
+function isImg(m: string): boolean { return m.startsWith("image/"); }
+
+function splitText(s: string): string[] {
+  if (s.length <= MAX_MSG) return [s];
+  const r: string[] = [];
+  for (let i = 0; i < s.length; i += MAX_MSG) r.push(s.slice(i, i + MAX_MSG));
+  return r;
 }
 
-function chunkText(text: string): string[] {
-  if (text.length <= MAX_MESSAGE_LENGTH) return [text];
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-    chunks.push(text.slice(i, i + MAX_MESSAGE_LENGTH));
-  }
-  return chunks;
+async function loadConfig(): Promise<BotConfig> {
+  try { return JSON.parse(await readFile(CONFIG_PATH, "utf8")); }
+  catch { return {}; }
 }
 
-async function readConfig(): Promise<WeComBotConfig> {
-  try {
-    return JSON.parse(await readFile(CONFIG_PATH, "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-async function saveConfig(config: WeComBotConfig): Promise<void> {
+async function saveConfig(c: BotConfig) {
   await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n");
+  await writeFile(CONFIG_PATH, JSON.stringify(c, null, "\t") + "\n");
 }
 
 // ============================================================================
-// Main Extension
+// Extension
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-  let config: WeComBotConfig = {};
-  let aibot: any = null;
-  let activeMessage: { content: Array<TextContent | ImageContent> } | null = null;
-  let setupDone = false;
-  let connected = false;
+  let cfg: BotConfig = {};
+  let bot: any = null;
+  let ok = false;
+  let busy = false;
 
-  // ------------------------------------------------------------------------
   // Status
-  // ------------------------------------------------------------------------
-  function status(ctx: ExtensionContext, error?: string): void {
+  function stat(ctx: ExtensionContext, err?: string) {
     const t = ctx.ui.theme;
-    const label = t.fg("accent", "wecom-bot");
-
-    if (error) {
-      ctx.ui.setStatus("wecom-bot", `${label} ${t.fg("error", error)}`);
-      return;
-    }
-
-    if (!config.webhookUrl) {
-      ctx.ui.setStatus("wecom-bot", `${label} ${t.fg("muted", "not configured")}`);
-      return;
-    }
-
-    ctx.ui.setStatus("wecom-bot", `${label} ${t.fg(connected ? "success" : "warning", connected ? "✅" : "⚡"}`);
+    if (err) ctx.ui.setStatus("wecom-bot", `${t.fg("accent", "wecom-bot")} ${t.fg("error", err)}`);
+    else if (!cfg.key) ctx.ui.setStatus("wecom-bot", `${t.fg("accent", "wecom-bot")} ${t.fg("muted", "not set")}`);
+    else ctx.ui.setStatus("wecom-bot", `${t.fg("accent", "wecom-bot")} ${t.fg(ok ? "success" : "warning", ok ? "✅" : "⚡")}`);
   }
 
-  // ------------------------------------------------------------------------
-  // 启动机器人
-  // ------------------------------------------------------------------------
-  async function startBot(ctx: ExtensionContext): Promise<void> {
-    if (!config.webhookUrl) {
-      console.log("[wecom-bot] 需要配置 Webhook URL");
-      return;
-    }
+  // Start
+  async function start(ctx: ExtensionContext) {
+    if (!cfg.key) return;
+    stop();
 
-    console.log("[wecom-bot] 正在启动...");
+    console.log("[wecom-bot] 启动中...");
+    bot = new Aibot({ key: cfg.key, secret: cfg.secret });
 
-    try {
-      // 从 Webhook URL 提取 key
-      const url = new URL(config.webhookUrl);
-      const key = url.searchParams.get("key");
+    bot.on("onStart", () => {
+      console.log("[wecom-bot] ✅ 已连接");
+      ok = true; stat(ctx);
+    });
 
-      if (!key) {
-        console.log("[wecom-bot] Webhook URL 中未找到 key");
-        status(ctx, "key not found");
-        return;
-      }
+    bot.on("onMessage", (msg: any) => {
+      const txt = msg.content || msg.text?.content || "";
+      if (!txt) return;
+      console.log("[wecom-bot] 收到:", txt.slice(0, 50));
+      pi.sendUserMessage([{ type: "text", text: `[wecom-bot] ${txt}` }]);
+    });
 
-      // 创建 aibot 实例
-      aibot = new Aibot({
-        key, // 必填，机器人key
-        secret: config.secret || undefined, // 选填，加签密钥
-      });
+    bot.on("onClose", () => {
+      console.log("[wecom-bot] ❌ 断开");
+      ok = false; stat(ctx);
+      if (cfg.enabled) setTimeout(() => start(ctx), 5000);
+    });
 
-      // 监听启动事件
-      aibot.on("onStart", () => {
-        console.log("[wecom-bot] ✅ 机器人启动成功");
-        connected = true;
-        status(ctx);
-      });
+    bot.on("onError", (e: any) => {
+      console.log("[wecom-bot] 错误:", e?.message || e);
+      ok = false; stat(ctx, e?.message || "error");
+    });
 
-      // 监听消息事件
-      aibot.on("onMessage", (msg: any) => {
-        console.log("[wecom-bot] 收到消息:", JSON.stringify(msg).slice(0, 200));
-
-        // 处理文本消息
-        const content = msg.content || msg.text?.content || "";
-        if (content) {
-          // 将消息转发给 pi 处理
-          const prompt = `[wecom-bot] ${content}`;
-          pi.sendUserMessage([{ type: "text", text: prompt }]);
-        }
-      });
-
-      // 监听关闭事件
-      aibot.on("onClose", () => {
-        console.log("[wecom-bot] ❌ 连接关闭");
-        connected = false;
-        status(ctx);
-      });
-
-      // 监听错误事件
-      aibot.on("onError", (err: any) => {
-        console.log("[wecom-bot] ❌ 错误:", err);
-        status(ctx, err.message || "error");
-      });
-
-      // 启动机器人
-      aibot.start();
-
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.log("[wecom-bot] 启动失败:", msg);
-      status(ctx, msg);
-    }
+    bot.start();
   }
 
-  // ------------------------------------------------------------------------
-  // 停止机器人
-  // ------------------------------------------------------------------------
-  function stopBot(): void {
-    if (aibot) {
-      aibot.stop();
-      aibot = null;
-    }
-    connected = false;
+  function stop() {
+    if (bot) { bot.stop(); bot = null; }
+    ok = false;
   }
 
-  // ------------------------------------------------------------------------
-  // 发送消息
-  // ------------------------------------------------------------------------
-  async function sendText(text: string): Promise<void> {
-    if (!aibot) {
-      console.log("[wecom-bot] 机器人未启动");
-      return;
-    }
-
-    for (const chunk of chunkText(text)) {
-      aibot.sendText(chunk);
-    }
+  // Send
+  async function sendText(txt: string) {
+    if (!bot) return;
+    for (const s of splitText(txt)) bot.sendText(s);
   }
 
-  async function sendMarkdown(md: string): Promise<void> {
-    if (!aibot) return;
-
-    for (const chunk of chunkText(md)) {
-      aibot.sendMarkdown(chunk);
-    }
+  async function sendMd(md: string) {
+    if (!bot) return;
+    for (const s of splitText(md)) bot.sendMarkdown(s);
   }
 
-  async function sendImage(base64: string, md5: string): Promise<void> {
-    if (!aibot) return;
-    aibot.sendImage(base64, md5);
+  async function sendImg(b64: string, md: string) {
+    if (!bot) return;
+    bot.sendImage(b64, md);
   }
 
-  // ------------------------------------------------------------------------
-  // 配置
-  // ------------------------------------------------------------------------
-  async function setup(ctx: ExtensionContext): Promise<void> {
-    if (!ctx.hasUI || setupDone) return;
-    setupDone = true;
+  // Setup
+  async function setup(ctx: ExtensionContext) {
+    const url = await ctx.ui.input("Webhook URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx");
+    if (!url) return;
 
-    const webhookUrl = await ctx.ui.input(
-      "Webhook URL",
-      "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-    );
-    if (!webhookUrl) {
-      setupDone = false;
-      return;
-    }
+    // 从URL提取key
+    const key = new URL(url).searchParams.get("key");
+    if (!key) { ctx.ui.notify("❌ URL中未找到key", "error"); return; }
 
     const secret = await ctx.ui.input("加签密钥(可选)", "");
-
-    config = {
-      webhookUrl: webhookUrl.trim(),
-      secret: secret.trim() || undefined,
-      enabled: true,
-    };
-
-    await saveConfig(config);
-    ctx.ui.notify("✅ 配置已保存", "success");
-
-    // 停止旧连接，启动新连接
-    stopBot();
-    await startBot(ctx);
-
-    setupDone = false;
+    cfg = { key, secret: secret || undefined, enabled: true };
+    await saveConfig(cfg);
+    ctx.ui.notify("✅ 已保存", "success");
+    await start(ctx);
   }
 
-  // ------------------------------------------------------------------------
-  // 工具
-  // ------------------------------------------------------------------------
+  // Tools
   pi.registerTool({
     name: "wecombot_attach",
     label: "WeCom Attach",
     description: "发送文件到企业微信群",
     parameters: Type.Object({
-      paths: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_ATTACHMENTS }),
+      paths: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_FILES }),
     }),
-    async execute(_id, params) {
-      const added: string[] = [];
-
-      for (const p of params.paths) {
-        if ((await stat(p)).isFile()) {
-          added.push(p);
-        }
+    async execute(_id, p) {
+      const files: string[] = [];
+      for (const fp of p.paths) {
+        if ((await stat(fp)).isFile()) files.push(fp);
       }
-
-      if (activeMessage && aibot) {
-        for (const filePath of added) {
-          const mime = guessMimeType(filePath);
-          if (isImage(mime)) {
-            const buf = await readFile(filePath);
-            await sendImage(buf.toString("base64"), buf.toString("hex").slice(0, 32));
+      if (bot && files.length) {
+        for (const fp of files) {
+          const mt = mimeType(fp);
+          if (isImg(mt)) {
+            const buf = await readFile(fp);
+            await sendImg(buf.toString("base64"), buf.toString("hex").slice(0, 32));
           } else {
-            await sendText(`📎 ${basename(filePath)}`);
+            await sendText(`📎 ${basename(fp)}`);
           }
         }
       }
-
-      return {
-        content: [{ type: "text", text: `已加入 ${added.length} 个附件` }],
-        details: {},
-      };
+      return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
     },
   });
 
   pi.registerTool({
     name: "wecom_send",
     label: "WeCom Send",
-    description: "发送消息到企业微信群",
+    description: "发送消息到群聊",
     parameters: Type.Object({
       message: Type.String(),
-      type: Type.Optional(
-        Type.Union([Type.Literal("text"), Type.Literal("markdown")])
-      ),
+      type: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("markdown")])),
     }),
-    async execute(_id, params) {
-      if (!aibot) {
-        throw new Error("机器人未连接");
-      }
-
-      try {
-        if (params.type === "markdown") {
-          await sendMarkdown(params.message);
-        } else {
-          await sendText(params.message);
-        }
-        return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
-      } catch (err) {
-        throw new Error(`发送失败: ${err instanceof Error ? err.message : String(err)}`);
-      }
+    async execute(_id, p) {
+      if (!bot) throw new Error("机器人未连接");
+      if (p.type === "markdown") await sendMd(p.message);
+      else await sendText(p.message);
+      return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
     },
   });
 
-  // ------------------------------------------------------------------------
-  // 命令
-  // ------------------------------------------------------------------------
+  // Commands
   pi.registerCommand("wecom-bot-setup", {
     description: "配置企业微信机器人",
-    handler: async (_args, ctx) => {
-      await setup(ctx);
-    },
+    handler: async (a, ctx) => { await setup(ctx); },
   });
 
   pi.registerCommand("wecom-bot-status", {
-    description: "查看机器人状态",
-    handler: async (_args, ctx) => {
-      if (!config.webhookUrl) {
-        ctx.ui.notify("❌ 未配置", "warning");
-      } else {
-        const key = config.webhookUrl.split("key=")[1]?.slice(0, 8) || "unknown";
-        ctx.ui.notify(`${connected ? "✅" : "⚡"} ${key}...`, "info");
-      }
+    description: "查看状态",
+    handler: async (_a, ctx) => {
+      if (!cfg.key) ctx.ui.notify("❌ 未配置", "warning");
+      else ctx.ui.notify(`${ok ? "✅" : "⚡"} ${cfg.key?.slice(0, 8)}...`, "info");
     },
   });
 
   pi.registerCommand("wecom-bot-test", {
-    description: "发送测试消息",
-    handler: async (_args, ctx) => {
-      if (!config.webhookUrl) {
-        ctx.ui.notify("请先配置", "warning");
-        return;
-      }
-      await sendText(`🧪 ${new Date().toLocaleString("zh-CN")} | pi-wecom 测试`);
+    description: "发送测试",
+    handler: async (_a, ctx) => {
+      if (!cfg.key) { ctx.ui.notify("请先配置", "warning"); return; }
+      await sendText(`🧪 ${new Date().toLocaleString("zh-CN")} | pi-wecom`);
       ctx.ui.notify("✅ 已发送", "success");
     },
   });
 
-  // ------------------------------------------------------------------------
-  // 事件
-  // ------------------------------------------------------------------------
+  // Events
   pi.on("session_start", async (_e, ctx) => {
-    config = await readConfig();
+    cfg = await loadConfig();
     await mkdir(TEMP_DIR, { recursive: true });
-
-    if (config.enabled && config.webhookUrl) {
-      await startBot(ctx);
-    }
-    status(ctx);
+    if (cfg.enabled && cfg.key) await start(ctx);
+    stat(ctx);
   });
 
-  pi.on("session_shutdown", () => {
-    stopBot();
-  });
+  pi.on("session_shutdown", () => { stop(); });
 
   pi.on("before_agent_start", async (e) => ({
-    systemPrompt: e.systemPrompt + SYSTEM_PROMPT,
+    systemPrompt: e.systemPrompt + PROMPT,
   }));
 
   pi.on("agent_end", async (e, ctx) => {
-    activeMessage = null;
-    status(ctx);
-
+    busy = false; stat(ctx);
     const msg = e.messages[e.messages.length - 1] as any;
-    if (!msg || msg.role !== "assistant") return;
-
-    const text = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
-    if (!text) return;
-
-    if (text.includes("```") || text.startsWith("#")) {
-      await sendMarkdown(text);
-    } else {
-      await sendText(text);
-    }
+    if (!msg?.content) return;
+    const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
+    if (!txt) return;
+    if (txt.includes("```") || txt.startsWith("#")) await sendMd(txt);
+    else await sendText(txt);
   });
 
-  return { config };
+  return { cfg: () => cfg };
 }
