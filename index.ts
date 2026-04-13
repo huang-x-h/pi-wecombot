@@ -150,6 +150,7 @@ export default function (pi: ExtensionAPI) {
   let ws: WSClient | null = null;
   let connected = false;
   let lastReqId = "";
+  let hasReplied = false;  // 防止重复回复
 
   const sessions = new Map<string, Session>();
   
@@ -264,6 +265,7 @@ export default function (pi: ExtensionAPI) {
 
       sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId });
       lastReqId = reqId;
+      hasReplied = false;  // 新消息，重置回复状态
 
       replyTo(reqId, "🤔 思考中...", false);
       
@@ -665,7 +667,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
-    if (!lastReqId || !sessions.has(lastReqId)) return;
+    if (!lastReqId || !sessions.has(lastReqId) || hasReplied) return;
     
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) return;
@@ -678,8 +680,15 @@ export default function (pi: ExtensionAPI) {
     const replyContent = txt.replace(pattern, "");
     
     if (replyContent.trim()) {
+      hasReplied = true;  // 标记已回复
       replyTo(lastReqId, replyContent, true);
       console.log(`[wecombot] 回复: ${replyContent.slice(0, 50)}`);
+      
+      // 延迟清除 lastReqId，防止后续误触发
+      setTimeout(() => {
+        lastReqId = "";
+        hasReplied = false;
+      }, 1000);
     }
   });
 }
