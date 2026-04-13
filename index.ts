@@ -152,6 +152,46 @@ export default function (pi: ExtensionAPI) {
   let lastReqId = "";
 
   const sessions = new Map<string, Session>();
+  
+  // 消息队列，避免并发冲突
+  const messageQueue: Array<{type: string, text: string}> = [];
+  let isProcessingQueue = false;
+  
+  // 处理消息队列
+  async function processMessageQueue() {
+    if (isProcessingQueue || messageQueue.length === 0) return;
+    isProcessingQueue = true;
+    
+    const message = messageQueue.shift();
+    if (message) {
+      try {
+        // 使用 @ts-ignore 因为 pi API 可能没有类型定义
+        // @ts-ignore
+        await pi.sendUserMessage([{ type: "text", text: message.text }]);
+      } catch (err: any) {
+        if (err?.message?.includes('already processing')) {
+          // 如果 Agent 忙，把消息放回队列头部，稍后重试
+          messageQueue.unshift(message);
+          console.log('[wecombot] Agent 忙，消息将在 500ms 后重试');
+        } else {
+          console.error('[wecombot] 发送消息失败:', err);
+        }
+      }
+    }
+    
+    isProcessingQueue = false;
+    
+    // 如果队列中还有消息，继续处理
+    if (messageQueue.length > 0) {
+      setTimeout(processMessageQueue, 500);
+    }
+  }
+  
+  // 发送消息到队列
+  function queueMessage(text: string) {
+    messageQueue.push({ type: "text", text });
+    processMessageQueue();
+  }
 
   // 清理过期会话
   setInterval(() => {
@@ -226,7 +266,9 @@ export default function (pi: ExtensionAPI) {
       lastReqId = reqId;
 
       replyTo(reqId, "🤔 思考中...", false);
-      pi.sendUserMessage([{ type: "text", text: `[wecombot] [${botName || botId}] [${userId}]\n${content}` }]);
+      
+      // 使用消息队列避免并发冲突
+      queueMessage(`[wecombot] [${botName || botId}] [${userId}]\n${content}`);
     });
 
     ws.on("message.image", (frame: any) => {
@@ -235,7 +277,8 @@ export default function (pi: ExtensionAPI) {
       if (url) {
         const userId = frame.body?.from?.userid || "unknown";
         sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId });
-        pi.sendUserMessage([{ type: "text", text: `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}` }]);
+        // 使用消息队列
+        queueMessage(`[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`);
       }
     });
 
