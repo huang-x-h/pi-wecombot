@@ -8,7 +8,7 @@
  */
 
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { WSClient, generateReqId } from "aibot-node-sdk";
 
@@ -25,10 +25,15 @@ interface BotConfig {
   name?: string;
 }
 
-interface Config {
+// 全局配置：所有会话共享机器人列表
+interface GlobalConfig {
   bots: BotConfig[];
-  activeBotId?: string;
-  enabled?: boolean;
+}
+
+// 会话配置：每个会话独立选择启用哪个机器人
+interface SessionConfig {
+  activeBotId?: string;  // 当前会话启用的机器人
+  enabled?: boolean;     // 当前会话是否启用
 }
 
 interface Session {
@@ -40,8 +45,37 @@ interface Session {
   botId: string;
 }
 
-const CONFIG = join(homedir(), ".pi", "agent", "wecom-bot.json");
-const TEMP = join(homedir(), ".pi", "agent", "tmp", "wecom-bot");
+// ============================================================================
+// Session Utils
+// ============================================================================
+
+// 获取会话唯一标识
+function getSessionId(): string {
+  return process.env.PI_SESSION_ID 
+    || process.env.PI_INSTANCE_ID
+    || `pid-${process.pid}`;
+}
+
+// 获取全局配置路径（机器人列表，所有会话共享）
+function getGlobalConfigPath(): string {
+  return join(homedir(), ".pi", "agent", "wecom-bot.json");
+}
+
+// 获取会话专属配置路径（会话选择哪个机器人，会话独立）
+function getSessionConfigPath(sessionId: string): string {
+  return join(homedir(), ".pi", "agent", `wecom-bot-session-${sessionId}.json`);
+}
+
+// 获取会话专属临时目录
+function getSessionTempPath(sessionId: string): string {
+  return join(homedir(), ".pi", "agent", "tmp", "wecom-bot", sessionId);
+}
+
+// 全局变量
+let SESSION_ID: string;
+let GLOBAL_CONFIG: string;
+let SESSION_CONFIG: string;
+let TEMP: string;
 
 const PROMPT = `
 [wecom-bot] 企业微信机器人已连接
@@ -50,28 +84,47 @@ const PROMPT = `
 - 使用 wecombot-attach 发送文件`;
 
 // ============================================================================
-// Utils
+// Config Management
 // ============================================================================
 
-async function load(): Promise<Config> {
+// 加载全局配置（机器人列表）
+async function loadGlobalConfig(): Promise<GlobalConfig> {
   try {
-    const data = JSON.parse(await readFile(CONFIG, "utf8"));
-    return { bots: data.bots || [], activeBotId: data.activeBotId, enabled: data.enabled ?? true };
+    const data = JSON.parse(await readFile(GLOBAL_CONFIG, "utf8"));
+    return { bots: data.bots || [] };
+  } catch {
+    return { bots: [] };
   }
-  catch { return { bots: [], enabled: true }; }
 }
 
-async function save(c: Config) {
-  await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-  await writeFile(CONFIG, JSON.stringify(c, null, "\t") + "\n");
+// 保存全局配置（机器人列表）
+async function saveGlobalConfig(c: GlobalConfig) {
+  await mkdir(dirname(GLOBAL_CONFIG), { recursive: true });
+  await writeFile(GLOBAL_CONFIG, JSON.stringify(c, null, "\t") + "\n");
 }
 
-function getActiveBot(cfg: Config): BotConfig | undefined {
-  return cfg.bots.find(b => b.botId === cfg.activeBotId) || cfg.bots[0];
+// 加载会话配置（会话选择的机器人和启用状态）
+async function loadSessionConfig(): Promise<SessionConfig> {
+  try {
+    const data = JSON.parse(await readFile(SESSION_CONFIG, "utf8"));
+    return { activeBotId: data.activeBotId, enabled: data.enabled ?? true };
+  } catch {
+    return { enabled: true };
+  }
 }
 
-function getBotById(cfg: Config, botId: string): BotConfig | undefined {
-  return cfg.bots.find(b => b.botId === botId);
+// 保存会话配置
+async function saveSessionConfig(c: SessionConfig) {
+  await mkdir(dirname(SESSION_CONFIG), { recursive: true });
+  await writeFile(SESSION_CONFIG, JSON.stringify(c, null, "\t") + "\n");
+}
+
+function getActiveBot(bots: BotConfig[], activeBotId?: string): BotConfig | undefined {
+  return bots.find(b => b.botId === activeBotId) || bots[0];
+}
+
+function getBotById(bots: BotConfig[], botId: string): BotConfig | undefined {
+  return bots.find(b => b.botId === botId);
 }
 
 // ============================================================================
@@ -79,7 +132,21 @@ function getBotById(cfg: Config, botId: string): BotConfig | undefined {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-  let cfg: Config = { bots: [], activeBotId: undefined, enabled: true };
+  // 初始化路径
+  SESSION_ID = getSessionId();
+  GLOBAL_CONFIG = getGlobalConfigPath();
+  SESSION_CONFIG = getSessionConfigPath(SESSION_ID);
+  TEMP = getSessionTempPath(SESSION_ID);
+  
+  console.log(`[wecombot] 会话ID: ${SESSION_ID.slice(0, 8)}`);
+  console.log(`[wecombot] 全局配置: ${GLOBAL_CONFIG}`);
+  console.log(`[wecombot] 会话配置: ${SESSION_CONFIG}`);
+  
+  // 全局机器人列表（从全局配置加载）
+  let globalBots: BotConfig[] = [];
+  // 会话配置（本会话选择哪个机器人）
+  let sessionCfg: SessionConfig = { enabled: true };
+  
   let ws: WSClient | null = null;
   let connected = false;
   let lastReqId = "";
@@ -100,14 +167,17 @@ export default function (pi: ExtensionAPI) {
   function setStatus(ctx: ExtensionContext, msg?: string) {
     const t = ctx.ui.theme;
     const tag = t.fg("accent", "🤖");
-    const active = getActiveBot(cfg);
+    const sessionShort = SESSION_ID.slice(0, 4);
+    const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     
     if (msg) {
-      ctx.ui.setStatus("wecombot", `${tag} ${t.fg("error", msg)}`);
+      ctx.ui.setStatus("wecombot", `${tag}[${sessionShort}] ${t.fg("error", msg)}`);
     } else if (!active) {
-      ctx.ui.setStatus("wecombot", `${tag} ${t.fg("muted", "未配置")}`);
+      ctx.ui.setStatus("wecombot", `${tag}[${sessionShort}] ${t.fg("muted", "未配置")}`);
     } else {
-      ctx.ui.setStatus("wecombot", `${tag} ${t.fg(connected ? "success" : "warning", connected ? `✅ (${sessions.size})` : "⚡")} ${active.name || active.botId.slice(0, 8)}`);
+      const statusIcon = connected ? `✅ (${sessions.size})` : "⚡";
+      const botName = active.name || active.botId.slice(0, 8);
+      ctx.ui.setStatus("wecombot", `${tag}[${sessionShort}] ${t.fg(connected ? "success" : "warning", statusIcon)} ${botName}`);
     }
   }
 
@@ -124,6 +194,7 @@ export default function (pi: ExtensionAPI) {
     disconnect();
 
     console.log(`[wecombot] 连接中: ${bot.name || bot.botId}`);
+    console.log(`[wecombot] ⚠️ 提示: 同一机器人只能有一个连接，其他会话将被断开`);
 
     ws = new WSClient({ botId: bot.botId, secret: bot.secret });
 
@@ -172,17 +243,34 @@ export default function (pi: ExtensionAPI) {
       ws.replyWelcome(frame, { msgtype: "text", text: { content: `👋 你好！我是 ${bot.name || "AI"} 助手，有什么可以帮你的吗？` } });
     });
 
-    ws.on("disconnected", () => {
-      console.log(`[wecombot] ❌ ${bot.name || bot.botId} 断开`);
+    ws.on("disconnected", (reason?: string) => {
+      const wasConnected = connected;
       connected = false;
       sessions.clear();
-      setStatus(ctx);
+      
+      const isKicked = reason?.includes("kick") || reason?.includes("replaced") || reason === "connection replaced";
+      const disconnectMsg = isKicked ? `被其他会话踢掉` : `断开`;
+      
+      console.log(`[wecombot] ❌ ${bot.name || bot.botId} ${disconnectMsg}${reason ? `: ${reason}` : ""}`);
+      
+      if (wasConnected && isKicked) {
+        setStatus(ctx, `被其他会话连接 (${SESSION_ID.slice(0, 4)})`);
+      } else {
+        setStatus(ctx);
+      }
     });
 
-    ws.on("error", (err) => {
+    ws.on("error", (err: any) => {
+      const errMsg = String(err);
       console.log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
       connected = false;
-      setStatus(ctx, String(err));
+      
+      if (errMsg.includes("already connected") || errMsg.includes("connection refused")) {
+        setStatus(ctx, "连接被占用");
+        ctx.ui.notify(`❌ ${bot.name || bot.botId} 连接失败：该机器人已在其他会话连接`, "error");
+      } else {
+        setStatus(ctx, errMsg);
+      }
     });
 
     ws.connect();
@@ -236,9 +324,9 @@ export default function (pi: ExtensionAPI) {
   // Commands
   // ============================================================================
 
-  // 添加机器人
+  // 【全局配置】添加机器人 - 所有会话可见
   pi.registerCommand("wecombot-add", {
-    description: "添加机器人",
+    description: "添加机器人（全局）",
     handler: async (_args, ctx) => {
       const name = await ctx.ui.input("机器人名称(可选)", "");
       const botId = await ctx.ui.input("BotID", "wwxxxxxxxxxxxxxxx");
@@ -246,124 +334,228 @@ export default function (pi: ExtensionAPI) {
       const secret = await ctx.ui.input("Secret", "");
       if (!secret) return;
 
-      cfg.bots = cfg.bots || [];
-      cfg.bots.push({ botId: botId.trim(), secret: secret.trim(), name: name?.trim() || undefined });
-      if (!cfg.activeBotId) cfg.activeBotId = botId.trim();
-      cfg.enabled = true;
-      await save(cfg);
-      ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}`, "success");
+      // 加载当前全局配置
+      const globalCfg = await loadGlobalConfig();
+      
+      // 检查是否已存在
+      if (globalCfg.bots.find(b => b.botId === botId.trim())) {
+        ctx.ui.notify("❌ 该机器人已存在", "error");
+        return;
+      }
+      
+      // 添加到全局配置
+      globalCfg.bots.push({ 
+        botId: botId.trim(), 
+        secret: secret.trim(), 
+        name: name?.trim() || undefined 
+      });
+      await saveGlobalConfig(globalCfg);
+      
+      // 更新当前会话的全局机器人列表
+      globalBots = globalCfg.bots;
+      
+      // 设置当前会话启用该机器人
+      if (!sessionCfg.activeBotId) {
+        sessionCfg.activeBotId = botId.trim();
+        sessionCfg.enabled = true;
+        await saveSessionConfig(sessionCfg);
+      }
+      
+      ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}（全局配置）`, "success");
       
       // 自动连接新添加的机器人
-      const newBot = cfg.bots[cfg.bots.length - 1];
+      const newBot = globalBots[globalBots.length - 1];
       await connect(ctx, newBot);
     },
   });
 
-  // 列出机器人
+  // 【全局配置】列出所有机器人
   pi.registerCommand("wecombot-list", {
-    description: "列出所有机器人",
+    description: "列出所有机器人（全局）",
     handler: async (_args, ctx) => {
-      if (cfg.bots.length === 0) {
-        ctx.ui.notify("暂无配置的机器人", "info");
+      // 重新加载全局配置
+      const globalCfg = await loadGlobalConfig();
+      globalBots = globalCfg.bots;
+      
+      if (globalBots.length === 0) {
+        ctx.ui.notify("全局暂无配置的机器人", "info");
       } else {
-        const list = cfg.bots.map(b => {
-          const isActive = b.botId === cfg.activeBotId ? "▶" : "○";
-          const isConnected = connected && b.botId === cfg.activeBotId ? "✅" : "";
-          return `${isActive} ${isConnected} ${b.name || b.botId}`;
+        const list = globalBots.map(b => {
+          const isSessionActive = b.botId === sessionCfg.activeBotId ? "▶" : "○";
+          const isConnected = connected && b.botId === sessionCfg.activeBotId ? "✅" : "";
+          return `${isSessionActive} ${isConnected} ${b.name || b.botId}`;
         }).join("\n");
-        ctx.ui.notify(`机器人列表:\n${list}`, "info");
+        const sessionInfo = sessionCfg.activeBotId ? `\n本会话启用: ${getActiveBot(globalBots, sessionCfg.activeBotId)?.name || sessionCfg.activeBotId}` : "\n本会话未启用机器人";
+        ctx.ui.notify(`全局机器人列表（共 ${globalBots.length} 个）:\n${list}${sessionInfo}`, "info");
       }
     },
   });
 
-  // 切换机器人
+  // 【会话配置】切换当前会话启用的机器人
   pi.registerCommand("wecombot-use", {
-    description: "切换机器人",
+    description: "切换机器人（本会话）",
     handler: async (_args, ctx) => {
-      if (cfg.bots.length === 0) {
-        ctx.ui.notify("暂无配置的机器人", "warning");
+      // 重新加载全局配置
+      const globalCfg = await loadGlobalConfig();
+      globalBots = globalCfg.bots;
+      
+      if (globalBots.length === 0) {
+        ctx.ui.notify("暂无配置的机器人，请先添加", "warning");
         return;
       }
       
-      const options = cfg.bots.map(b => 
-        `${b.botId === cfg.activeBotId ? "▶ " : "○ "}${b.name || b.botId}`
+      const options = globalBots.map(b => 
+        `${b.botId === sessionCfg.activeBotId ? "▶ " : "○ "}${b.name || b.botId}`
       );
       
-      // 如果只有一个机器人，直接使用
-      if (options.length === 1) {
-        const bot = cfg.bots[0];
-        cfg.activeBotId = bot.botId;
-        cfg.enabled = true;
-        await save(cfg);
-        ctx.ui.notify(`✅ 已切换到 ${bot.name || bot.botId}`, "success");
-        await connect(ctx, bot);
-        return;
-      }
-      
-      const selected = await ctx.ui.select("选择机器人", options);
+      const selected = await ctx.ui.select("选择机器人（仅本会话）", options);
       if (!selected) return;
       
       const selectedLabel = selected.replace(/^[▶○] /, "");
-      const bot = cfg.bots.find(b => b.botId === selectedLabel || (b.name || b.botId) === selectedLabel);
+      const bot = globalBots.find(b => b.botId === selectedLabel || (b.name || b.botId) === selectedLabel);
       if (!bot) {
         ctx.ui.notify("❌ 机器人不存在", "error");
         return;
       }
 
-      cfg.activeBotId = bot.botId;
-      cfg.enabled = true;
-      await save(cfg);
-      ctx.ui.notify(`✅ 已切换到 ${bot.name || bot.botId}`, "success");
+      // 只更新会话配置
+      sessionCfg.activeBotId = bot.botId;
+      sessionCfg.enabled = true;
+      await saveSessionConfig(sessionCfg);
+      
+      ctx.ui.notify(`✅ 本会话已切换到 ${bot.name || bot.botId}`, "success");
       await connect(ctx, bot);
     },
   });
 
-  // 删除机器人
+  // 【全局配置】删除机器人
   pi.registerCommand("wecombot-remove", {
-    description: "删除机器人",
+    description: "删除机器人（全局）",
     handler: async (_args, ctx) => {
-      if (cfg.bots.length === 0) {
+      // 重新加载全局配置
+      const globalCfg = await loadGlobalConfig();
+      globalBots = globalCfg.bots;
+      
+      if (globalBots.length === 0) {
         ctx.ui.notify("暂无配置的机器人", "warning");
         return;
       }
+      
       const name = await ctx.ui.input("输入要删除的BotID或名称", "");
       if (!name) return;
 
-      const idx = cfg.bots.findIndex(b => b.botId === name || b.name === name);
+      const idx = globalBots.findIndex(b => b.botId === name || b.name === name);
       if (idx === -1) {
         ctx.ui.notify("❌ 机器人不存在", "error");
         return;
       }
 
-      const removed = cfg.bots.splice(idx, 1)[0];
-      if (cfg.activeBotId === removed.botId) {
-        cfg.activeBotId = cfg.bots[0]?.botId;
-      }
-      await save(cfg);
-      ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}`, "success");
+      const removed = globalBots.splice(idx, 1)[0];
       
-      // 如果删除的是当前连接的机器人，切换到下一个
-      if (removed.botId !== cfg.activeBotId) {
-        // 需要重连
-      } else if (cfg.bots.length > 0) {
-        await connect(ctx, cfg.bots[0]);
-      } else {
+      // 保存全局配置
+      await saveGlobalConfig({ bots: globalBots });
+      
+      // 如果删除的是本会话启用的机器人，需要切换
+      if (sessionCfg.activeBotId === removed.botId) {
         disconnect();
+        sessionCfg.activeBotId = globalBots[0]?.botId;
+        await saveSessionConfig(sessionCfg);
+        
+        if (globalBots.length > 0) {
+          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}，自动切换到下一个`, "success");
+          const nextBot = getActiveBot(globalBots, sessionCfg.activeBotId);
+          if (nextBot && sessionCfg.enabled) await connect(ctx, nextBot);
+        } else {
+          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}（无可用机器人）`, "success");
+        }
+      } else {
+        ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}`, "success");
       }
     },
   });
 
-  // 状态
+  // 【混合】状态查看
   pi.registerCommand("wecombot-status", {
     description: "查看机器人状态",
     handler: async (_args, ctx) => {
-      const active = getActiveBot(cfg);
-      if (!active) ctx.ui.notify("❌ 未配置", "warning");
-      else ctx.ui.notify(`${connected ? "✅" : "⚡"} ${active.name || active.botId} | ${sessions.size} 会话`, "info");
+      // 重新加载全局配置
+      const globalCfg = await loadGlobalConfig();
+      globalBots = globalCfg.bots;
+      
+      const active = getActiveBot(globalBots, sessionCfg.activeBotId);
+      if (!active) {
+        ctx.ui.notify(
+          `全局机器人: ${globalBots.length} 个\n` +
+          `本会话状态: 未选择机器人`,
+          "info"
+        );
+        return;
+      }
+      
+      let statusIcon: string;
+      let statusText: string;
+      
+      if (!sessionCfg.enabled) {
+        statusIcon = "🔴";
+        statusText = "已禁用";
+      } else if (connected) {
+        statusIcon = "✅";
+        statusText = "已连接";
+      } else {
+        statusIcon = "❌";
+        statusText = "已断开";
+      }
+      
+      ctx.ui.notify(
+        `${statusIcon} ${active.name || active.botId}\n` +
+        `状态: ${statusText}\n` +
+        `全局机器人: ${globalBots.length} 个\n` +
+        `本会话活跃会话: ${sessions.size} 个\n` +
+        `会话ID: ${SESSION_ID.slice(0, 8)}`,
+        "info"
+      );
     },
   });
 
-  // 会话详情
+  // 【会话配置】启用本会话连接
+  pi.registerCommand("wecombot-enable", {
+    description: "启用机器人（本会话）",
+    handler: async (_args, ctx) => {
+      if (sessionCfg.enabled) {
+        ctx.ui.notify("本会话机器人已是启用状态", "info");
+        return;
+      }
+      sessionCfg.enabled = true;
+      await saveSessionConfig(sessionCfg);
+      
+      const bot = getActiveBot(globalBots, sessionCfg.activeBotId);
+      if (bot) {
+        await connect(ctx, bot);
+        ctx.ui.notify(`✅ 本会话已启用并连接 ${bot.name || bot.botId}`, "success");
+      } else {
+        ctx.ui.notify("✅ 本会话已启用，但未选择机器人，请先添加或使用 /wecombot-use 选择", "warning");
+      }
+      setStatus(ctx);
+    },
+  });
+
+  // 【会话配置】禁用本会话连接
+  pi.registerCommand("wecombot-disable", {
+    description: "禁用机器人（本会话）",
+    handler: async (_args, ctx) => {
+      if (!sessionCfg.enabled) {
+        ctx.ui.notify("本会话机器人已是禁用状态", "info");
+        return;
+      }
+      sessionCfg.enabled = false;
+      await saveSessionConfig(sessionCfg);
+      disconnect();
+      ctx.ui.notify("🔌 本会话已禁用机器人并断开连接", "info");
+      setStatus(ctx);
+    },
+  });
+
+  // 【会话】查看会话详情
   pi.registerCommand("wecombot-session", {
     description: "查看当前会话详情",
     handler: async (_args, ctx) => {
@@ -371,11 +563,31 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("暂无活跃会话", "info");
         return;
       }
-      const active = getActiveBot(cfg);
+      const active = getActiveBot(globalBots, sessionCfg.activeBotId);
       const sessionList = Array.from(sessions.entries()).map(([reqId, s]) => 
         `[${active?.name || s.botId}]\n  reqId: ${reqId}\n  userId: ${s.userId}\n  chatId: ${s.chatId}`
       ).join("\n\n");
       ctx.ui.notify(`当前会话:\n${sessionList}`, "info");
+    },
+  });
+
+  // 【会话】查看会话信息
+  pi.registerCommand("wecombot-session-info", {
+    description: "查看会话信息",
+    handler: async (_args, ctx) => {
+      const info = [
+        `会话ID: ${SESSION_ID}`,
+        `全局配置: ${GLOBAL_CONFIG}`,
+        `会话配置: ${SESSION_CONFIG}`,
+        `临时目录: ${TEMP}`,
+        ``,
+        `【全局】机器人数量: ${globalBots.length}`,
+        `【会话】启用机器人: ${sessionCfg.activeBotId || "无"}`,
+        `【会话】启用状态: ${sessionCfg.enabled ? "✅" : "🔴"}`,
+        `【会话】连接状态: ${connected ? "🟢 已连接" : "⚪ 未连接"}`,
+        `【会话】活跃消息会话: ${sessions.size} 个`,
+      ].join("\n");
+      ctx.ui.notify(info, "info");
     },
   });
 
@@ -384,12 +596,21 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   pi.on("session_start", async (_e, ctx) => {
-    cfg = await load();
+    // 加载全局机器人列表
+    const globalCfg = await loadGlobalConfig();
+    globalBots = globalCfg.bots;
+    
+    // 加载本会话配置
+    sessionCfg = await loadSessionConfig();
+    
     await mkdir(TEMP, { recursive: true });
-    if (cfg.enabled && cfg.bots.length > 0) {
-      const bot = getActiveBot(cfg);
+    
+    // 如果启用了且选择了机器人，则连接
+    if (sessionCfg.enabled && sessionCfg.activeBotId) {
+      const bot = getBotById(globalBots, sessionCfg.activeBotId);
       if (bot) await connect(ctx, bot);
     }
+    
     setStatus(ctx);
   });
 
@@ -409,7 +630,7 @@ export default function (pi: ExtensionAPI) {
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) return;
     
-    const active = getActiveBot(cfg);
+    const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     const pattern = new RegExp(`\\[wecombot\\] \\[${active?.name || active?.botId || ""}\\] \\[([^\\]]+)\\]\\n?`, "g");
     const replyContent = txt.replace(pattern, "");
     
