@@ -206,29 +206,27 @@ export default function (pi: ExtensionAPI) {
     }
   }, 60000);
 
-  // Status - 优化展示，未配置时隐藏
+  // Status - 只展示 Bot 名称和连接状态，未配置时隐藏
   function setStatus(ctx: ExtensionContext, msg?: string) {
-    const t = ctx.ui.theme;
-    const tag = t.fg("accent", "🤖");
     const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     
-    // 如果没有配置机器人，不显示状态栏（完全隐藏）
+    // 如果没有配置机器人，完全隐藏状态栏
     if (!active) {
-      // 清空状态栏，不显示任何内容
       ctx.ui.setStatus("wecombot", "");
       return;
     }
     
-    // 获取会话短ID（显示后4位）
-    const sessionShort = SESSION_ID.slice(-4);
     const botName = active.name || active.botId.slice(0, 8);
     
     if (msg) {
-      ctx.ui.setStatus("wecombot", `${tag}[${sessionShort}] ${t.fg("error", msg)} ${botName}`);
+      // 有错误信息时显示
+      ctx.ui.setStatus("wecombot", `${botName} 🔴 ${msg}`);
+    } else if (connected) {
+      // 已连接
+      ctx.ui.setStatus("wecombot", `${botName} ✅ ${sessions.size}`);
     } else {
-      const statusIcon = connected ? `✅ ${sessions.size}` : "⚡";
-      const color = connected ? "success" : "warning";
-      ctx.ui.setStatus("wecombot", `${tag}[${sessionShort}] ${t.fg(color, statusIcon)} ${botName}`);
+      // 未连接
+      ctx.ui.setStatus("wecombot", `${botName} ⚡`);
     }
   }
 
@@ -438,11 +436,8 @@ export default function (pi: ExtensionAPI) {
           const isConnected = connected && b.botId === sessionCfg.activeBotId ? "✅" : "";
           return `${isSessionActive} ${isConnected} ${b.name || b.botId}`;
         }).join("\n");
-        const sessionInfo = sessionCfg.activeBotId ? `
-本会话启用: ${getActiveBot(globalBots, sessionCfg.activeBotId)?.name || sessionCfg.activeBotId}` : "
-本会话未启用机器人";
-        ctx.ui.notify(`全局机器人列表（共 ${globalBots.length} 个）:
-${list}${sessionInfo}`, "info");
+        const sessionInfo = sessionCfg.activeBotId ? `本会话启用: ${getActiveBot(globalBots, sessionCfg.activeBotId)?.name || sessionCfg.activeBotId}` : "本会话未启用机器人";
+        ctx.ui.notify(`全局机器人列表（共 ${globalBots.length} 个）: ${list}${sessionInfo}`, "info");
       }
     },
   });
