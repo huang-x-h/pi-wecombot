@@ -45,6 +45,13 @@ interface Session {
   botId: string;
 }
 
+// 待处理消息项
+interface PendingMessage {
+  reqId: string;
+  type: string;
+  text: string;
+}
+
 // ============================================================================
 // Session Utils
 // ============================================================================
@@ -154,45 +161,65 @@ export default function (pi: ExtensionAPI) {
   
   let ws: WSClient | null = null;
   let connected = false;
-  let lastReqId = "";
-  let hasReplied = false;  // 防止重复回复
 
   const sessions = new Map<string, Session>();
   
-  // 消息队列，避免并发冲突
-  const messageQueue: Array<{type: string, text: string}> = [];
-  let isProcessingQueue = false;
+  // 待处理消息队列，每条消息关联 reqId
+  const pendingMessages: PendingMessage[] = [];
+  let isProcessing = false;
+  let currentReqId: string | null = null;  // 当前正在处理的 reqId
   
   // 处理消息队列
   async function processMessageQueue() {
-    if (isProcessingQueue || messageQueue.length === 0) return;
-    isProcessingQueue = true;
+    if (isProcessing || pendingMessages.length === 0) return;
+    isProcessing = true;
     
-    const message = messageQueue.shift();
-    if (message) {
-      try {
-        // @ts-ignore
-        await pi.sendUserMessage([{ type: "text", text: message.text }]);
-      } catch (err: any) {
-        if (err?.message?.includes('already processing')) {
-          messageQueue.unshift(message);
-          console.log('[wecombot] Agent 忙，消息将在 500ms 后重试');
-        } else {
-          console.error('[wecombot] 发送消息失败:', err);
-        }
+    // 取出队首消息（不删除，等 AI 回复后再删除）
+    const message = pendingMessages[0];
+    if (!message) {
+      isProcessing = false;
+      return;
+    }
+    
+    // 检查会话是否还存在
+    if (!sessions.has(message.reqId)) {
+      // 会话已过期，移除并处理下一条
+      console.log(`[wecombot] 会话 ${message.reqId.slice(0, 8)} 已过期，跳过`);
+      pendingMessages.shift();
+      isProcessing = false;
+      processMessageQueue();
+      return;
+    }
+    
+    currentReqId = message.reqId;
+    
+    try {
+      // @ts-ignore
+      await pi.sendUserMessage([{ type: "text", text: message.text }]);
+      console.log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
+    } catch (err: any) {
+      if (err?.message?.includes('already processing')) {
+        console.log('[wecombot] Agent 忙，消息将在 500ms 后重试');
+        currentReqId = null;
+      } else {
+        console.error('[wecombot] 发送消息失败:', err);
+        pendingMessages.shift();  // 移除失败消息
+        currentReqId = null;
       }
     }
     
-    isProcessingQueue = false;
+    isProcessing = false;
     
-    if (messageQueue.length > 0) {
+    // 如果没有错误，等待 agent_end 后再处理下一条
+    if (currentReqId === null && pendingMessages.length > 0) {
       setTimeout(processMessageQueue, 500);
     }
   }
   
-  // 发送消息到队列
-  function queueMessage(text: string) {
-    messageQueue.push({ type: "text", text });
+  // 发送消息到队列（关联 reqId）
+  function queueMessage(reqId: string, text: string) {
+    pendingMessages.push({ reqId, type: "text", text });
+    console.log(`[wecombot] 消息入队: reqId=${reqId.slice(0, 8)}, 队列长度=${pendingMessages.length}`);
     processMessageQueue();
   }
 
@@ -206,27 +233,24 @@ export default function (pi: ExtensionAPI) {
     }
   }, 60000);
 
-  // Status - 只展示 Bot 名称和连接状态，未配置时隐藏
+  // Status - 已连接后才显示，未连接时不显示
   function setStatus(ctx: ExtensionContext, msg?: string) {
     const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     
-    // 如果没有配置机器人，完全隐藏状态栏
-    if (!active) {
+    // 已连接才显示状态栏
+    if (!connected) {
       ctx.ui.setStatus("wecombot", "");
       return;
     }
     
-    const botName = active.name || active.botId.slice(0, 8);
+    const botName = active?.name || active?.botId.slice(0, 8) || "企微";
     
     if (msg) {
       // 有错误信息时显示
-      ctx.ui.setStatus("wecombot", `${botName} 🔴 ${msg}`);
-    } else if (connected) {
-      // 已连接
-      ctx.ui.setStatus("wecombot", `${botName} ✅ ${sessions.size}`);
+      ctx.ui.setStatus("wecombot", `${botName}【wecom】🔴 ${msg}`);
     } else {
-      // 未连接
-      ctx.ui.setStatus("wecombot", `${botName} ⚡`);
+      // 已连接
+      ctx.ui.setStatus("wecombot", `${botName}【wecom】✅ ${sessions.size}`);
     }
   }
 
@@ -273,11 +297,10 @@ export default function (pi: ExtensionAPI) {
         console.log(`[wecombot] [${botName || botId}] [${userId}] ${content.slice(0, 30)}`);
 
         sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId });
-        lastReqId = reqId;
-        hasReplied = false;
 
         replyTo(reqId, "🤔 思考中...", false);
-        queueMessage(`[wecombot] [${botName || botId}] [${userId}]\n${content}`);
+        // 消息关联 reqId 入队
+        queueMessage(reqId, `[wecombot] [${botName || botId}] [${userId}]\n${content}`);
       });
 
       ws.on("message.image", (frame: any) => {
@@ -286,7 +309,8 @@ export default function (pi: ExtensionAPI) {
         if (url) {
           const userId = frame.body?.from?.userid || "unknown";
           sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId });
-          queueMessage(`[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`);
+          // 图片消息也关联 reqId
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`);
         }
       });
 
@@ -665,8 +689,7 @@ ${sessionList}`, "info");
           }
         }
       }
-      
-      setStatus(ctx);
+      // 注意：不调用 setStatus，连接过程中 ws.on('connected') 会自动调用
     } catch (err) {
       console.error(`[wecombot] session_start 异常:`, err);
       // 不影响 pi 启动
@@ -687,27 +710,46 @@ ${sessionList}`, "info");
 
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
-    if (!lastReqId || !sessions.has(lastReqId) || hasReplied) return;
+    
+    // 检查当前是否有正在处理的消息
+    if (!currentReqId || pendingMessages.length === 0) return;
+    
+    // 确认是当前请求的回复
+    const pending = pendingMessages[0];
+    if (pending.reqId !== currentReqId) return;
     
     const msg = e.messages[e.messages.length - 1] as any;
-    if (!msg?.content) return;
+    if (!msg?.content) {
+      // 没有回复内容，移除消息并继续处理下一条
+      pendingMessages.shift();
+      currentReqId = null;
+      processMessageQueue();
+      return;
+    }
     
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
-    if (!txt) return;
+    if (!txt) {
+      pendingMessages.shift();
+      currentReqId = null;
+      processMessageQueue();
+      return;
+    }
     
     const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     const pattern = new RegExp(`\\[wecombot\\] \\[${active?.name || active?.botId || ""}\\] \\[([^\\]]+)\\]\\n?`, "g");
     const replyContent = txt.replace(pattern, "");
     
+    // 回复给对应的用户
     if (replyContent.trim()) {
-      hasReplied = true;
-      replyTo(lastReqId, replyContent, true);
-      console.log(`[wecombot] 回复: ${replyContent.slice(0, 50)}`);
-      
-      setTimeout(() => {
-        lastReqId = "";
-        hasReplied = false;
-      }, 1000);
+      replyTo(pending.reqId, replyContent, true);
+      console.log(`[wecombot] 回复: reqId=${pending.reqId.slice(0, 8)}, 内容=${replyContent.slice(0, 50)}`);
     }
+    
+    // 移除已处理的消息
+    pendingMessages.shift();
+    currentReqId = null;
+    
+    // 处理下一条消息
+    processMessageQueue();
   });
 }
