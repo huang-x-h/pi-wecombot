@@ -378,7 +378,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, p) {
       if (!ws || !connected) throw new Error("机器人未连接");
       const reqId = sessions.keys().next().value;
-      if (!reqId) throw new Error("无活跃会话");
+      if (!reqId) throw new Error("无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。");
       const files: string[] = [];
       for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
       for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
@@ -389,14 +389,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "wecombot-send",
     label: "发送消息",
-    description: "发送消息到企业微信",
+    description: "发送消息到企业微信（仅在回复用户消息时可用）",
     parameters: Type.Object({
       message: Type.String(),
     }),
     async execute(_id, p) {
       if (!ws || !connected) throw new Error("机器人未连接");
       const reqId = sessions.keys().next().value;
-      if (!reqId) throw new Error("无活跃会话");
+      if (!reqId) throw new Error("无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。");
       replyTo(reqId, p.message, true);
       return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
     },
