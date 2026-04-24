@@ -29,8 +29,7 @@
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@mariozechner/pi-coding-agent": "*"
   },
   "dependencies": {
     "aibot-node-sdk": "^1.0.3"

@@ -315,7 +315,7 @@ export default function (pi: ExtensionAPI) {
       });
 
       ws.on("event.enter_chat", (frame: any) => {
-        ws.replyWelcome(frame, { msgtype: "text", text: { content: `👋 你好！我是 ${bot.name || "AI"} 助手，有什么可以帮你的吗？` } });
+        ws && ws.replyWelcome(frame, { msgtype: "text", text: { content: `👋 你好！我是 ${bot.name || "AI"} 助手，有什么可以帮你的吗？` } });
       });
 
       ws.on("disconnected", (reason?: string) => {
@@ -438,7 +438,7 @@ export default function (pi: ExtensionAPI) {
         await saveSessionConfig(sessionCfg);
       }
       
-      ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}（全局配置）`, "success");
+      ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}（全局配置）`, "info");
       
       const newBot = globalBots[globalBots.length - 1];
       await connect(ctx, newBot);
@@ -496,7 +496,7 @@ export default function (pi: ExtensionAPI) {
       sessionCfg.enabled = true;
       await saveSessionConfig(sessionCfg);
       
-      ctx.ui.notify(`✅ 本会话已切换到 ${bot.name || bot.botId}`, "success");
+      ctx.ui.notify(`✅ 本会话已切换到 ${bot.name || bot.botId}`, "info");
       await connect(ctx, bot);
     },
   });
@@ -532,14 +532,14 @@ export default function (pi: ExtensionAPI) {
         await saveSessionConfig(sessionCfg);
         
         if (globalBots.length > 0) {
-          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}，自动切换到下一个`, "success");
+          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}，自动切换到下一个`, "info");
           const nextBot = getActiveBot(globalBots, sessionCfg.activeBotId);
           if (nextBot && sessionCfg.enabled) await connect(ctx, nextBot);
         } else {
-          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}（无可用机器人）`, "success");
+          ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}（无可用机器人）`, "info");
         }
       } else {
-        ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}`, "success");
+        ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}`, "info");
       }
     },
   });
@@ -600,7 +600,7 @@ export default function (pi: ExtensionAPI) {
       const bot = getActiveBot(globalBots, sessionCfg.activeBotId);
       if (bot) {
         await connect(ctx, bot);
-        ctx.ui.notify(`✅ 本会话已启用并连接 ${bot.name || bot.botId}`, "success");
+        ctx.ui.notify(`✅ 本会话已启用并连接 ${bot.name || bot.botId}`, "info");
       } else {
         ctx.ui.notify("✅ 本会话已启用，但未选择机器人，请先添加或使用 /wecombot-use 选择", "warning");
       }
