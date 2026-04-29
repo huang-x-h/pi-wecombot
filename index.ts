@@ -10,7 +10,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { WSClient, generateReqId } from "aibot-node-sdk";
+import { WSClient, generateReqId, decryptFile } from "aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -221,7 +221,7 @@ export default function (pi: ExtensionAPI) {
     for (const point of PROGRESS_NOTIFY_POINTS) {
       if (!sent.has(point.delay) && elapsedMs >= point.delay) {
         sent.add(point.delay);
-        ws?.replyStream(session.frame, session.streamId, point.message, false);
+        ws?.replyStream(session.frame, session.streamId, point.message, true); // 必须 isEnd=true，否则草稿状态锁定会话导致最终回复无效
         console.log(`[wecombot] 进度通知: reqId=${reqId.slice(0, 8)}, 已运行 ${Math.round(elapsedMs / 1000)}秒`);
         break;
       }
@@ -409,22 +409,39 @@ export default function (pi: ExtensionAPI) {
         queueMessage(reqId, `[wecombot] [${botName || botId}] [${userId}]\n${content}`, session);
       });
 
-      ws.on("message.image", (frame: any) => {
+      ws.on("message.image", async (frame: any) => {
         const url = frame.body?.image?.url;
+        const aesKey = frame.body?.image?.aeskey;
         const reqId = frame.headers?.req_id || generateReqId("msg");
         if (url) {
           const userId = frame.body?.from?.userid || "unknown";
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`, session);
+          
+          // 下载并解密图片
+          try {
+            if (!ws) throw new Error("WS未连接"); const { buffer } = await ws.downloadFile(url, aesKey);
+            const base64Image = buffer.toString('base64');
+            // 保存到临时目录
+            const filename = `img_${Date.now()}.jpg`;
+            const filepath = join(TEMP, filename);
+            await writeFile(filepath, buffer);
+            console.log(`[wecombot] 图片已保存: ${filepath}`);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${filepath}
+[base64图片: data:image/jpeg;base64,${base64Image.substring(0, 100)}...]`, session);
+          } catch (err) {
+            console.error(`[wecombot] 图片下载失败:`, err);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片（下载失败）: ${url}`, session);
+          }
         }
       });
 
-      ws.on("message.mixed", (frame: any) => {
+      ws.on("message.mixed", async (frame: any) => {
         const msgItems = frame.body?.mixed?.msg_item;
         const reqId = frame.headers?.req_id || generateReqId("msg");
         if (!Array.isArray(msgItems) || msgItems.length === 0) return;
+
 
         const userId = frame.body?.from?.userid || "unknown";
         const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
@@ -432,22 +449,45 @@ export default function (pi: ExtensionAPI) {
 
         // 解析图文混排内容
         let textParts: string[] = [];
-        let imageUrls: string[] = [];
+        let imageInfos: { url: string; aeskey?: string }[] = [];
         
         for (const item of msgItems) {
           if (item.msgtype === "text" && item.text?.content) {
             textParts.push(item.text.content);
           } else if (item.msgtype === "image" && item.image?.url) {
-            imageUrls.push(item.image.url);
+            imageInfos.push({ url: item.image.url, aeskey: item.image.aeskey });
           }
         }
 
         const contentText = textParts.join(" ");
-        const imageText = imageUrls.length > 0 ? `\n[图片: ${imageUrls.join(", ")}]` : "";
         
-        if (contentText || imageUrls.length > 0) {
+        // 下载图片
+        let imageText = "";
+        if (imageInfos.length > 0 && ws) {
+          for (const img of imageInfos) {
+            try {
+              const { buffer } = await ws.downloadFile(img.url, img.aeskey);
+              const filename = `img_${Date.now()}.jpg`;
+              const filepath = join(TEMP, filename);
+              await writeFile(filepath, buffer);
+              console.log(`[wecombot] mixed图片已保存: ${filepath}`);
+              imageText += `
+[图片: ${filepath}]`;
+            } catch (err) {
+              console.error(`[wecombot] mixed图片下载失败:`, err);
+              imageText += `
+[图片（下载失败）: ${img.url}]`;
+            }
+          }
+        } else if (imageInfos.length > 0) {
+          imageText = `
+[图片: ${imageInfos.map(i => i.url).join(", ")}]`;
+        }
+        
+        if (contentText || imageText) {
           replyTo(reqId, "🤔 思考中...", false);
-          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}]\n${contentText}${imageText}`, session);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}]
+${contentText}${imageText}`, session);
         }
       });
 
@@ -463,28 +503,55 @@ export default function (pi: ExtensionAPI) {
         }
       });
 
-      ws.on("message.file", (frame: any) => {
+      ws.on("message.file", async (frame: any) => {
         const url = frame.body?.file?.url;
         const filename = frame.body?.file?.filename || "文件";
+        const aesKey = frame.body?.file?.aeskey;
         const reqId = frame.headers?.req_id || generateReqId("msg");
         if (url) {
           const userId = frame.body?.from?.userid || "unknown";
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${filename}」: ${url}`, session);
+          
+          // 下载并解密文件
+          try {
+            if (!ws) throw new Error("WS未连接");
+            const { buffer, filename: downloadedFilename } = await ws.downloadFile(url, aesKey);
+            const savedFilename = downloadedFilename || filename;
+            const filepath = join(TEMP, `file_${Date.now()}_${savedFilename}`);
+            await writeFile(filepath, buffer);
+            console.log(`[wecombot] 文件已保存: ${filepath}`);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${savedFilename}」: ${filepath}`, session);
+          } catch (err) {
+            console.error(`[wecombot] 文件下载失败:`, err);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${filename}」（下载失败）: ${url}`, session);
+          }
         }
       });
 
-      ws.on("message.video", (frame: any) => {
+      ws.on("message.video", async (frame: any) => {
         const url = frame.body?.video?.url;
+        const aesKey = frame.body?.video?.aeskey;
         const reqId = frame.headers?.req_id || generateReqId("msg");
         if (url) {
           const userId = frame.body?.from?.userid || "unknown";
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频: ${url}`, session);
+          
+          // 下载并解密视频
+          try {
+            if (!ws) throw new Error("WS未连接");
+            const { buffer } = await ws.downloadFile(url, aesKey);
+            const filepath = join(TEMP, `video_${Date.now()}.mp4`);
+            await writeFile(filepath, buffer);
+            console.log(`[wecombot] 视频已保存: ${filepath}`);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频: ${filepath}`, session);
+          } catch (err) {
+            console.error(`[wecombot] 视频下载失败:`, err);
+            queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频（下载失败）: ${url}`, session);
+          }
         }
       });
 
