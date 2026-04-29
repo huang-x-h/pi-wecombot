@@ -332,7 +332,7 @@ export default function (pi: ExtensionAPI) {
   setInterval(() => {
     const now = Date.now();
     for (const [reqId, session] of sessions) {
-      if (now - session.timestamp > 10 * 60 * 1000) {
+      if (now - session.timestamp > 60 * 60 * 1000) {
         sessions.delete(reqId);
       }
     }
@@ -361,10 +361,18 @@ export default function (pi: ExtensionAPI) {
 
   // 回复
   function replyTo(reqId: string, content: string, isEnd = true) {
-    if (!ws || !connected) return;
+    if (!ws || !connected) {
+      console.log(`[wecombot] 回复失败: ws未连接, reqId=${reqId.slice(0, 8)}`);
+      return;
+    }
     const session = sessions.get(reqId);
-    if (!session) return;
+    if (!session) {
+      console.log(`[wecombot] 回复失败: 会话不存在, reqId=${reqId.slice(0, 8)}, 当前sessions=${sessions.size}`);
+      return;
+    }
+    console.log(`[wecombot] 准备回复: reqId=${reqId.slice(0, 8)}, isEnd=${isEnd}, content=${content.slice(0, 30)}`);
     ws.replyStream(session.frame, session.streamId, content, isEnd);
+    console.log(`[wecombot] 回复已发送: reqId=${reqId.slice(0, 8)}`);
   }
 
   // 连接 - 添加错误保护
