@@ -45,13 +45,6 @@ interface Session {
   botId: string;
 }
 
-// 待处理消息项
-interface PendingMessage {
-  reqId: string;
-  type: string;
-  text: string;
-}
-
 // ============================================================================
 // Session Utils
 // ============================================================================
@@ -164,10 +157,107 @@ export default function (pi: ExtensionAPI) {
 
   const sessions = new Map<string, Session>();
   
+  // 待处理消息项
+  interface PendingMessage {
+    reqId: string;
+    type: string;
+    text: string;
+    timestamp: number;
+    conversationId: string;
+  }
+
   // 待处理消息队列，每条消息关联 reqId
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
   let currentReqId: string | null = null;  // 当前正在处理的 reqId
+
+  // 消息进度跟踪（持续通知）
+  const messageTimeouts = new Map<string, NodeJS.Timeout>();
+  
+  // 持续进度通知时间点：5分钟、15分钟、30分钟、1小时
+  const PROGRESS_NOTIFY_POINTS = [
+    { delay: 5 * 60 * 1000, message: "⏳ 还在处理中，请耐心等待..." },
+    { delay: 15 * 60 * 1000, message: "⏳ 处理时间较长，请继续等待..." },
+    { delay: 30 * 60 * 1000, message: "⏳ 仍在处理中，可能需要较长时间..." },
+    { delay: 60 * 60 * 1000, message: "⏳ 已处理超过1小时，感谢您的耐心..." },
+  ];
+  const PROGRESS_NOTIFY_INTERVAL = 60 * 1000; // 1分钟后开始检查进度通知
+
+  // 记录已发送的通知时间点（避免重复发送）
+  const notifiedPoints = new Map<string, Set<number>>();
+
+  // 获取会话标识
+  function getConversationId(session: Session): string {
+    return session.chatId || session.userId;
+  }
+
+  // 【增强】获取队列位置信息
+  function getQueuePosition(conversationId: string): { total: number; position: number; ahead: number } {
+    let position = 0;
+    let ahead = 0;
+    for (let i = 0; i < pendingMessages.length; i++) {
+      if (pendingMessages[i].conversationId === conversationId) {
+        position = i + 1;
+        break;
+      }
+      ahead++;
+    }
+    return { total: pendingMessages.length, position, ahead };
+  }
+
+  // 【增强】发送处理进度通知（持续通知）
+  async function sendProgressNotification(
+    reqId: string,
+    session: Session,
+    elapsedMs: number
+  ): Promise<void> {
+    if (currentReqId !== reqId) return;
+    
+    if (!notifiedPoints.has(reqId)) {
+      notifiedPoints.set(reqId, new Set());
+    }
+    const sent = notifiedPoints.get(reqId)!;
+    
+    for (const point of PROGRESS_NOTIFY_POINTS) {
+      if (!sent.has(point.delay) && elapsedMs >= point.delay) {
+        sent.add(point.delay);
+        ws?.replyStream(session.frame, session.streamId, point.message, false);
+        console.log(`[wecombot] 进度通知: reqId=${reqId.slice(0, 8)}, 已运行 ${Math.round(elapsedMs / 1000)}秒`);
+        break;
+      }
+    }
+  }
+
+  // 【增强】启动持续进度通知检查
+  function startProgressNotifier(reqId: string, session: Session, startTime: number) {
+    const checkInterval = setInterval(() => {
+      if (currentReqId !== reqId) {
+        clearInterval(checkInterval);
+        notifiedPoints.delete(reqId);
+        return;
+      }
+      
+      const elapsed = Date.now() - startTime;
+      sendProgressNotification(reqId, session, elapsed);
+      
+      const sent = notifiedPoints.get(reqId);
+      if (sent && sent.size >= PROGRESS_NOTIFY_POINTS.length) {
+        clearInterval(checkInterval);
+      }
+    }, PROGRESS_NOTIFY_INTERVAL);
+    
+    messageTimeouts.set(reqId + '_progress', checkInterval);
+  }
+
+  // 【增强】清理进度通知定时器
+  function clearProgressNotifier(reqId: string) {
+    const interval = messageTimeouts.get(reqId + '_progress');
+    if (interval) {
+      clearInterval(interval);
+      messageTimeouts.delete(reqId + '_progress');
+    }
+    notifiedPoints.delete(reqId);
+  }
   
   // 处理消息队列
   async function processMessageQueue() {
@@ -193,9 +283,15 @@ export default function (pi: ExtensionAPI) {
     
     currentReqId = message.reqId;
     
+    // 【增强】启动持续进度通知
+    const session = sessions.get(message.reqId);
+    if (session) {
+      startProgressNotifier(message.reqId, session, Date.now());
+    }
+    
     try {
       // @ts-ignore
-      await pi.sendUserMessage([{ type: "text", text: message.text }]);
+      await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "steer" });
       console.log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
     } catch (err: any) {
       if (err?.message?.includes('already processing')) {
@@ -217,8 +313,17 @@ export default function (pi: ExtensionAPI) {
   }
   
   // 发送消息到队列（关联 reqId）
-  function queueMessage(reqId: string, text: string) {
-    pendingMessages.push({ reqId, type: "text", text });
+  function queueMessage(reqId: string, text: string, session: Session) {
+    const conversationId = getConversationId(session);
+    const queueLength = pendingMessages.length;
+    
+    // 【增强】发送队列位置反馈
+    if (queueLength > 0) {
+      // 队列中有其他消息，告知用户排队位置
+      replyTo(reqId, `👋 收到，你是第 ${queueLength + 1} 位，前面还有 ${queueLength} 条消息...`, false);
+    }
+    
+    pendingMessages.push({ reqId, type: "text", text, timestamp: Date.now(), conversationId });
     console.log(`[wecombot] 消息入队: reqId=${reqId.slice(0, 8)}, 队列长度=${pendingMessages.length}`);
     processMessageQueue();
   }
@@ -296,11 +401,12 @@ export default function (pi: ExtensionAPI) {
 
         console.log(`[wecombot] [${botName || botId}] [${userId}] ${content.slice(0, 30)}`);
 
-        sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId });
+        const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId };
+        sessions.set(reqId, session);
 
         replyTo(reqId, "🤔 思考中...", false);
-        // 消息关联 reqId 入队
-        queueMessage(reqId, `[wecombot] [${botName || botId}] [${userId}]\n${content}`);
+        // 消息关联 reqId 入队，传入 session
+        queueMessage(reqId, `[wecombot] [${botName || botId}] [${userId}]\n${content}`, session);
       });
 
       ws.on("message.image", (frame: any) => {
@@ -308,9 +414,77 @@ export default function (pi: ExtensionAPI) {
         const reqId = frame.headers?.req_id || generateReqId("msg");
         if (url) {
           const userId = frame.body?.from?.userid || "unknown";
-          sessions.set(reqId, { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId });
-          // 图片消息也关联 reqId
-          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`);
+          const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
+          sessions.set(reqId, session);
+          replyTo(reqId, "🤔 思考中...", false);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${url}`, session);
+        }
+      });
+
+      ws.on("message.mixed", (frame: any) => {
+        const msgItems = frame.body?.mixed?.msg_item;
+        const reqId = frame.headers?.req_id || generateReqId("msg");
+        if (!Array.isArray(msgItems) || msgItems.length === 0) return;
+
+        const userId = frame.body?.from?.userid || "unknown";
+        const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
+        sessions.set(reqId, session);
+
+        // 解析图文混排内容
+        let textParts: string[] = [];
+        let imageUrls: string[] = [];
+        
+        for (const item of msgItems) {
+          if (item.msgtype === "text" && item.text?.content) {
+            textParts.push(item.text.content);
+          } else if (item.msgtype === "image" && item.image?.url) {
+            imageUrls.push(item.image.url);
+          }
+        }
+
+        const contentText = textParts.join(" ");
+        const imageText = imageUrls.length > 0 ? `\n[图片: ${imageUrls.join(", ")}]` : "";
+        
+        if (contentText || imageUrls.length > 0) {
+          replyTo(reqId, "🤔 思考中...", false);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}]\n${contentText}${imageText}`, session);
+        }
+      });
+
+      ws.on("message.voice", (frame: any) => {
+        const content = frame.body?.voice?.content;
+        const reqId = frame.headers?.req_id || generateReqId("msg");
+        if (content) {
+          const userId = frame.body?.from?.userid || "unknown";
+          const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
+          sessions.set(reqId, session);
+          replyTo(reqId, "🤔 思考中...", false);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}]\n${content}`, session);
+        }
+      });
+
+      ws.on("message.file", (frame: any) => {
+        const url = frame.body?.file?.url;
+        const filename = frame.body?.file?.filename || "文件";
+        const reqId = frame.headers?.req_id || generateReqId("msg");
+        if (url) {
+          const userId = frame.body?.from?.userid || "unknown";
+          const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
+          sessions.set(reqId, session);
+          replyTo(reqId, "🤔 思考中...", false);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${filename}」: ${url}`, session);
+        }
+      });
+
+      ws.on("message.video", (frame: any) => {
+        const url = frame.body?.video?.url;
+        const reqId = frame.headers?.req_id || generateReqId("msg");
+        if (url) {
+          const userId = frame.body?.from?.userid || "unknown";
+          const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
+          sessions.set(reqId, session);
+          replyTo(reqId, "🤔 思考中...", false);
+          queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频: ${url}`, session);
         }
       });
 
@@ -721,6 +895,7 @@ ${sessionList}`, "info");
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) {
       // 没有回复内容，移除消息并继续处理下一条
+      clearProgressNotifier(currentReqId);
       pendingMessages.shift();
       currentReqId = null;
       processMessageQueue();
@@ -729,6 +904,7 @@ ${sessionList}`, "info");
     
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) {
+      clearProgressNotifier(currentReqId);
       pendingMessages.shift();
       currentReqId = null;
       processMessageQueue();
@@ -744,6 +920,9 @@ ${sessionList}`, "info");
       replyTo(pending.reqId, replyContent, true);
       console.log(`[wecombot] 回复: reqId=${pending.reqId.slice(0, 8)}, 内容=${replyContent.slice(0, 50)}`);
     }
+    
+    // 【增强】清理进度通知定时器
+    clearProgressNotifier(currentReqId);
     
     // 移除已处理的消息
     pendingMessages.shift();
