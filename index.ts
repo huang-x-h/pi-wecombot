@@ -16,6 +16,23 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 
 // ============================================================================
+// Global Error Handlers
+// ============================================================================
+
+// 防止未捕获的 promise rejection 导致进程崩溃
+process.on("unhandledRejection", (reason) => {
+  // 忽略流已过期错误
+  if (reason && typeof reason === "object") {
+    const err = reason as any;
+    if (err.errcode === 846608 || err.message?.includes("expired") || err.message?.includes("stream message update expired")) {
+      console.log("[wecombot] 忽略流过期错误");
+      return;
+    }
+  }
+  console.error("[wecombot] 未捕获的 promise rejection:", reason);
+});
+
+// ============================================================================
 // Config
 // ============================================================================
 
@@ -176,12 +193,11 @@ export default function (pi: ExtensionAPI) {
   
   // 持续进度通知时间点：5分钟、15分钟、30分钟、1小时
   const PROGRESS_NOTIFY_POINTS = [
-    { delay: 5 * 60 * 1000, message: "⏳ 还在处理中，请耐心等待..." },
-    { delay: 15 * 60 * 1000, message: "⏳ 处理时间较长，请继续等待..." },
-    { delay: 30 * 60 * 1000, message: "⏳ 仍在处理中，可能需要较长时间..." },
-    { delay: 60 * 60 * 1000, message: "⏳ 已处理超过1小时，感谢您的耐心..." },
+    { delay: 5 * 60 * 1000, message: "⏳ 正在处理中，请稍候..." },
+    { delay: 8 * 60 * 1000, message: "⏳ 处理时间较长，请继续等待..." },
+    { delay: 9 * 60 * 1000, message: "⚠️ 即将超时，请尽快回复" },
   ];
-  const PROGRESS_NOTIFY_INTERVAL = 60 * 1000; // 1分钟后开始检查进度通知
+  const PROGRESS_NOTIFY_INTERVAL = 30 * 1000; // 每30秒检查一次进度通知
 
   // 记录已发送的通知时间点（避免重复发送）
   const notifiedPoints = new Map<string, Set<number>>();
@@ -218,11 +234,28 @@ export default function (pi: ExtensionAPI) {
     }
     const sent = notifiedPoints.get(reqId)!;
     
+    // 企业微信限制：超过 10 分钟无法回复，跳过超时后的通知
+    const STREAM_TIMEOUT_MS = 10 * 60 * 1000;
+    
     for (const point of PROGRESS_NOTIFY_POINTS) {
+      // 跳过超过 10 分钟的通知点
+      if (point.delay > STREAM_TIMEOUT_MS) {
+        if (!sent.has(point.delay) && elapsedMs >= point.delay) {
+          sent.add(point.delay);
+
+        }
+        continue;
+      }
+      
       if (!sent.has(point.delay) && elapsedMs >= point.delay) {
         sent.add(point.delay);
-        ws?.replyStream(session.frame, session.streamId, point.message, true); // 必须 isEnd=true，否则草稿状态锁定会话导致最终回复无效
-        console.log(`[wecombot] 进度通知: reqId=${reqId.slice(0, 8)}, 已运行 ${Math.round(elapsedMs / 1000)}秒`);
+        // 必须 isEnd=true，否则草稿状态锁定会话导致最终回复无效
+        ws?.replyStream(session.frame, session.streamId, point.message, true).catch((err: any) => {
+          // 忽略超时错误
+          if (err?.errcode !== 846608) {
+            console.error(`[wecombot] 进度通知失败:`, err);
+          }
+        });
         break;
       }
     }
@@ -290,7 +323,6 @@ export default function (pi: ExtensionAPI) {
     }
     
     try {
-      // @ts-ignore
       await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "steer" });
       console.log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
     } catch (err: any) {
@@ -324,7 +356,6 @@ export default function (pi: ExtensionAPI) {
     }
     
     pendingMessages.push({ reqId, type: "text", text, timestamp: Date.now(), conversationId });
-    console.log(`[wecombot] 消息入队: reqId=${reqId.slice(0, 8)}, 队列长度=${pendingMessages.length}`);
     processMessageQueue();
   }
 
@@ -370,9 +401,14 @@ export default function (pi: ExtensionAPI) {
       console.log(`[wecombot] 回复失败: 会话不存在, reqId=${reqId.slice(0, 8)}, 当前sessions=${sessions.size}`);
       return;
     }
-    console.log(`[wecombot] 准备回复: reqId=${reqId.slice(0, 8)}, isEnd=${isEnd}, content=${content.slice(0, 30)}`);
-    ws.replyStream(session.frame, session.streamId, content, isEnd);
-    console.log(`[wecombot] 回复已发送: reqId=${reqId.slice(0, 8)}`);
+    ws.replyStream(session.frame, session.streamId, content, isEnd).catch((err: any) => {
+      // 忽略流已过期错误（正常情况，10分钟后自动触发）
+      if (err?.errcode === 846608 || err?.message?.includes('expired')) {
+        console.log(`[wecombot] 流已过期: reqId=${reqId.slice(0, 8)}`);
+      } else {
+        console.error(`[wecombot] 回复异常: reqId=${reqId.slice(0, 8)}`, err);
+      }
+    });
   }
 
   // 连接 - 添加错误保护
@@ -993,7 +1029,7 @@ ${sessionList}`, "info");
     // 回复给对应的用户
     if (replyContent.trim()) {
       replyTo(pending.reqId, replyContent, true);
-      console.log(`[wecombot] 回复: reqId=${pending.reqId.slice(0, 8)}, 内容=${replyContent.slice(0, 50)}`);
+
     }
     
     // 【增强】清理进度通知定时器
