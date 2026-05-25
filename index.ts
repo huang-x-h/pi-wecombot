@@ -172,6 +172,10 @@ export default function (pi: ExtensionAPI) {
   let ws: WSClient | null = null;
   let connected = false;
 
+  // 暴露状态给外部（用于条件注册工具）
+  const isWecomConnected = () => ws !== null && connected;
+  let toolsRegistered = false;
+
   const sessions = new Map<string, Session>();
   
   // 待处理消息项
@@ -431,6 +435,10 @@ export default function (pi: ExtensionAPI) {
         console.log(`[wecombot] ✅ ${bot.name || bot.botId} 认证成功`);
         connected = true;
         setStatus(ctx);
+        if (!toolsRegistered) {
+          registerTools();
+          toolsRegistered = true;
+        }
       });
 
       ws.on("message.text", (frame: any) => {
@@ -653,39 +661,48 @@ ${contentText}${imageText}`, session);
   // Tools
   // ============================================================================
 
-  pi.registerTool({
-    name: "wecombot-attach",
-    label: "发送文件",
-    description: "发送本地文件到企业微信",
-    parameters: Type.Object({
-      paths: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
-    }),
-    async execute(_id, p) {
-      if (!ws || !connected) throw new Error("机器人未连接");
-      const reqId = sessions.keys().next().value;
-      if (!reqId) throw new Error("无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。");
-      const files: string[] = [];
-      for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
-      for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
-      return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
-    },
-  });
+  function registerTools() {
+    pi.registerTool({
+      name: "wecombot-attach",
+      label: "发送文件",
+      description: "发送本地文件到企业微信",
+      parameters: Type.Object({
+        paths: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
+      }),
+      async execute(_id, p) {
+        if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
+        const reqId = sessions.keys().next().value;
+        if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
+        const files: string[] = [];
+        for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
+        for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
+        return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
+      },
+    });
 
-  pi.registerTool({
-    name: "wecombot-send",
-    label: "发送消息",
-    description: "发送消息到企业微信（仅在回复用户消息时可用）",
-    parameters: Type.Object({
-      message: Type.String(),
-    }),
-    async execute(_id, p) {
-      if (!ws || !connected) throw new Error("机器人未连接");
-      const reqId = sessions.keys().next().value;
-      if (!reqId) throw new Error("无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。");
-      replyTo(reqId, p.message, true);
-      return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
-    },
-  });
+
+    pi.registerTool({
+      name: "wecombot-send",
+      label: "发送消息",
+      description: "发送消息到企业微信（仅在回复用户消息时可用）",
+      parameters: Type.Object({
+        message: Type.String(),
+      }),
+      async execute(_id, p) {
+        if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
+        const reqId = sessions.keys().next().value;
+        if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
+        replyTo(reqId, p.message, true);
+        return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
+      },
+    });
+  }
+
+  // 首次加载时注册工具（用于会话恢复场景）
+  if (!toolsRegistered && isWecomConnected()) {
+    registerTools();
+    toolsRegistered = true;
+  }
 
   // ============================================================================
   // Commands
