@@ -175,6 +175,11 @@ export default function (pi: ExtensionAPI) {
   // 暴露状态给外部（用于条件注册工具）
   const isWecomConnected = () => ws !== null && connected;
   let toolsRegistered = false;
+n  // 保存当前会话的 ctx，用于 WebSocket 回调
+  let currentCtx: ExtensionContext | null = null;
+
+  // 保存当前会话的 ctx，用于 WebSocket 回调
+  let currentCtx: ExtensionContext | null = null;
 
   const sessions = new Map<string, Session>();
   
@@ -666,15 +671,16 @@ ${contentText}${imageText}`, session);
       name: "wecombot-attach",
       label: "发送文件",
       description: "发送本地文件到企业微信",
+      promptSnippet: "Attach and send local files to WeCom chat",
       parameters: Type.Object({
         paths: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
       }),
-      async execute(_id, p) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
         const reqId = sessions.keys().next().value;
         if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
         const files: string[] = [];
-        for (const fp of p.paths) if ((await stat(fp)).isFile()) files.push(fp);
+        for (const fp of params.paths) if ((await stat(fp)).isFile()) files.push(fp);
         for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
         return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
       },
@@ -685,14 +691,15 @@ ${contentText}${imageText}`, session);
       name: "wecombot-send",
       label: "发送消息",
       description: "发送消息到企业微信（仅在回复用户消息时可用）",
+      promptSnippet: "Send a text message to WeCom chat",
       parameters: Type.Object({
         message: Type.String(),
       }),
-      async execute(_id, p) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
         const reqId = sessions.keys().next().value;
         if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
-        replyTo(reqId, p.message, true);
+        replyTo(reqId, params.message, true);
         return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
       },
     });
@@ -972,6 +979,8 @@ ${sessionList}`, "info");
 
   pi.on("session_start", async (_e, ctx) => {
     try {
+      // 保存当前会话的 ctx，供 WebSocket 回调使用
+      currentCtx = ctx;
       // 加载全局机器人列表
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
