@@ -1,9 +1,9 @@
 /**
  * pi-wecombot
- * 
+ *
  * 企业微信智能机器人 WebSocket 长连接扩展 for pi
  * 支持多个机器人配置和快速切换
- * 
+ *
  * 参考: https://developer.work.weixin.qq.com/document/path/101463
  */
 
@@ -71,7 +71,7 @@ function getSessionId(): string {
   // 优先使用 pi 提供的环境变量
   if (process.env.PI_SESSION_ID) return process.env.PI_SESSION_ID;
   if (process.env.PI_INSTANCE_ID) return process.env.PI_INSTANCE_ID;
-  
+
   // 备用：使用时间戳+随机数，确保唯一性
   const timestamp = Date.now().toString(36);
   const random = Math.random().toString(36).substring(2, 6);
@@ -159,30 +159,27 @@ export default function (pi: ExtensionAPI) {
   GLOBAL_CONFIG = getGlobalConfigPath();
   SESSION_CONFIG = getSessionConfigPath(SESSION_ID);
   TEMP = getSessionTempPath(SESSION_ID);
-  
+
   console.log(`[wecombot] 会话ID: ${SESSION_ID.slice(0, 8)}`);
   console.log(`[wecombot] 全局配置: ${GLOBAL_CONFIG}`);
   console.log(`[wecombot] 会话配置: ${SESSION_CONFIG}`);
-  
+
   // 全局机器人列表（从全局配置加载）
   let globalBots: BotConfig[] = [];
   // 会话配置（本会话选择哪个机器人）
   let sessionCfg: SessionConfig = { enabled: true };
-  
+
   let ws: WSClient | null = null;
   let connected = false;
 
   // 暴露状态给外部（用于条件注册工具）
   const isWecomConnected = () => ws !== null && connected;
   let toolsRegistered = false;
-n  // 保存当前会话的 ctx，用于 WebSocket 回调
-  let currentCtx: ExtensionContext | null = null;
-
   // 保存当前会话的 ctx，用于 WebSocket 回调
   let currentCtx: ExtensionContext | null = null;
 
   const sessions = new Map<string, Session>();
-  
+
   // 待处理消息项
   interface PendingMessage {
     reqId: string;
@@ -199,7 +196,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
 
   // 消息进度跟踪（持续通知）
   const messageTimeouts = new Map<string, NodeJS.Timeout>();
-  
+
   // 持续进度通知时间点：5分钟、15分钟、30分钟、1小时
   const PROGRESS_NOTIFY_POINTS = [
     { delay: 5 * 60 * 1000, message: "⏳ 正在处理中，请稍候..." },
@@ -237,15 +234,15 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
     elapsedMs: number
   ): Promise<void> {
     if (currentReqId !== reqId) return;
-    
+
     if (!notifiedPoints.has(reqId)) {
       notifiedPoints.set(reqId, new Set());
     }
     const sent = notifiedPoints.get(reqId)!;
-    
+
     // 企业微信限制：超过 10 分钟无法回复，跳过超时后的通知
     const STREAM_TIMEOUT_MS = 10 * 60 * 1000;
-    
+
     for (const point of PROGRESS_NOTIFY_POINTS) {
       // 跳过超过 10 分钟的通知点
       if (point.delay > STREAM_TIMEOUT_MS) {
@@ -255,7 +252,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
         }
         continue;
       }
-      
+
       if (!sent.has(point.delay) && elapsedMs >= point.delay) {
         sent.add(point.delay);
         // 必须 isEnd=true，否则草稿状态锁定会话导致最终回复无效
@@ -278,16 +275,16 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
         notifiedPoints.delete(reqId);
         return;
       }
-      
+
       const elapsed = Date.now() - startTime;
       sendProgressNotification(reqId, session, elapsed);
-      
+
       const sent = notifiedPoints.get(reqId);
       if (sent && sent.size >= PROGRESS_NOTIFY_POINTS.length) {
         clearInterval(checkInterval);
       }
     }, PROGRESS_NOTIFY_INTERVAL);
-    
+
     messageTimeouts.set(reqId + '_progress', checkInterval);
   }
 
@@ -300,19 +297,19 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
     }
     notifiedPoints.delete(reqId);
   }
-  
+
   // 处理消息队列
   async function processMessageQueue() {
     if (isProcessing || pendingMessages.length === 0) return;
     isProcessing = true;
-    
+
     // 取出队首消息（不删除，等 AI 回复后再删除）
     const message = pendingMessages[0];
     if (!message) {
       isProcessing = false;
       return;
     }
-    
+
     // 检查会话是否还存在
     if (!sessions.has(message.reqId)) {
       // 会话已过期，移除并处理下一条
@@ -322,15 +319,15 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
       processMessageQueue();
       return;
     }
-    
+
     currentReqId = message.reqId;
-    
+
     // 【增强】启动持续进度通知
     const session = sessions.get(message.reqId);
     if (session) {
       startProgressNotifier(message.reqId, session, Date.now());
     }
-    
+
     try {
       await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "steer" });
       console.log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
@@ -344,26 +341,26 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
         currentReqId = null;
       }
     }
-    
+
     isProcessing = false;
-    
+
     // 如果没有错误，等待 agent_end 后再处理下一条
     if (currentReqId === null && pendingMessages.length > 0) {
       setTimeout(processMessageQueue, 500);
     }
   }
-  
+
   // 发送消息到队列（关联 reqId）
   function queueMessage(reqId: string, text: string, session: Session) {
     const conversationId = getConversationId(session);
     const queueLength = pendingMessages.length;
-    
+
     // 【增强】发送队列位置反馈
     if (queueLength > 0) {
       // 队列中有其他消息，告知用户排队位置
       replyTo(reqId, `👋 收到，你是第 ${queueLength + 1} 位，前面还有 ${queueLength} 条消息...`, false);
     }
-    
+
     pendingMessages.push({ reqId, type: "text", text, timestamp: Date.now(), conversationId });
     processMessageQueue();
   }
@@ -381,15 +378,15 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
   // Status - 已连接后才显示，未连接时不显示
   function setStatus(ctx: ExtensionContext, msg?: string) {
     const active = getActiveBot(globalBots, sessionCfg.activeBotId);
-    
+
     // 已连接才显示状态栏
     if (!connected) {
       ctx.ui.setStatus("wecombot", "");
       return;
     }
-    
+
     const botName = active?.name || active?.botId.slice(0, 8) || "企微";
-    
+
     if (msg) {
       // 有错误信息时显示
       ctx.ui.setStatus("wecombot", `${botName}【wecom】🔴 ${msg}`);
@@ -475,7 +472,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          
+
           // 下载并解密图片
           try {
             if (!ws) throw new Error("WS未连接"); const { buffer } = await ws.downloadFile(url, aesKey);
@@ -507,7 +504,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
         // 解析图文混排内容
         let textParts: string[] = [];
         let imageInfos: { url: string; aeskey?: string }[] = [];
-        
+
         for (const item of msgItems) {
           if (item.msgtype === "text" && item.text?.content) {
             textParts.push(item.text.content);
@@ -517,7 +514,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
         }
 
         const contentText = textParts.join(" ");
-        
+
         // 下载图片
         let imageText = "";
         if (imageInfos.length > 0 && ws) {
@@ -540,7 +537,7 @@ n  // 保存当前会话的 ctx，用于 WebSocket 回调
           imageText = `
 [图片: ${imageInfos.map(i => i.url).join(", ")}]`;
         }
-        
+
         if (contentText || imageText) {
           replyTo(reqId, "🤔 思考中...", false);
           queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}]
@@ -570,7 +567,7 @@ ${contentText}${imageText}`, session);
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          
+
           // 下载并解密文件
           try {
             if (!ws) throw new Error("WS未连接");
@@ -596,7 +593,7 @@ ${contentText}${imageText}`, session);
           const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId: frame.body?.chatid || "", timestamp: Date.now(), botId: bot.botId };
           sessions.set(reqId, session);
           replyTo(reqId, "🤔 思考中...", false);
-          
+
           // 下载并解密视频
           try {
             if (!ws) throw new Error("WS未连接");
@@ -620,12 +617,12 @@ ${contentText}${imageText}`, session);
         const wasConnected = connected;
         connected = false;
         sessions.clear();
-        
+
         const isKicked = reason?.includes("kick") || reason?.includes("replaced") || reason === "connection replaced";
         const disconnectMsg = isKicked ? `被其他会话踢掉` : `断开`;
-        
+
         console.log(`[wecombot] ❌ ${bot.name || bot.botId} ${disconnectMsg}${reason ? `: ${reason}` : ""}`);
-        
+
         if (wasConnected && isKicked) {
           setStatus(ctx, `被其他会话连接 (${SESSION_ID.slice(0, 4)})`);
         } else {
@@ -637,7 +634,7 @@ ${contentText}${imageText}`, session);
         const errMsg = String(err);
         console.log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
         connected = false;
-        
+
         if (errMsg.includes("already connected") || errMsg.includes("connection refused")) {
           setStatus(ctx, "连接被占用");
           ctx.ui.notify(`❌ ${bot.name || bot.botId} 连接失败：该机器人已在其他会话连接`, "error");
@@ -726,29 +723,29 @@ ${contentText}${imageText}`, session);
       if (!secret) return;
 
       const globalCfg = await loadGlobalConfig();
-      
+
       if (globalCfg.bots.find(b => b.botId === botId.trim())) {
         ctx.ui.notify("❌ 该机器人已存在", "error");
         return;
       }
-      
-      globalCfg.bots.push({ 
-        botId: botId.trim(), 
-        secret: secret.trim(), 
-        name: name?.trim() || undefined 
+
+      globalCfg.bots.push({
+        botId: botId.trim(),
+        secret: secret.trim(),
+        name: name?.trim() || undefined
       });
       await saveGlobalConfig(globalCfg);
-      
+
       globalBots = globalCfg.bots;
-      
+
       if (!sessionCfg.activeBotId) {
         sessionCfg.activeBotId = botId.trim();
         sessionCfg.enabled = true;
         await saveSessionConfig(sessionCfg);
       }
-      
+
       ctx.ui.notify(`✅ 已添加 ${name || botId.slice(0, 8)}（全局配置）`, "info");
-      
+
       const newBot = globalBots[globalBots.length - 1];
       await connect(ctx, newBot);
     },
@@ -760,7 +757,7 @@ ${contentText}${imageText}`, session);
     handler: async (_args, ctx) => {
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
-      
+
       if (globalBots.length === 0) {
         ctx.ui.notify("全局暂无配置的机器人", "info");
       } else {
@@ -781,19 +778,19 @@ ${contentText}${imageText}`, session);
     handler: async (_args, ctx) => {
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
-      
+
       if (globalBots.length === 0) {
         ctx.ui.notify("暂无配置的机器人，请先添加", "warning");
         return;
       }
-      
-      const options = globalBots.map(b => 
+
+      const options = globalBots.map(b =>
         `${b.botId === sessionCfg.activeBotId ? "▶ " : "○ "}${b.name || b.botId}`
       );
-      
+
       const selected = await ctx.ui.select("选择机器人（仅本会话）", options);
       if (!selected) return;
-      
+
       const selectedLabel = selected.replace(/^[▶○] /, "");
       const bot = globalBots.find(b => b.botId === selectedLabel || (b.name || b.botId) === selectedLabel);
       if (!bot) {
@@ -804,7 +801,7 @@ ${contentText}${imageText}`, session);
       sessionCfg.activeBotId = bot.botId;
       sessionCfg.enabled = true;
       await saveSessionConfig(sessionCfg);
-      
+
       ctx.ui.notify(`✅ 本会话已切换到 ${bot.name || bot.botId}`, "info");
       await connect(ctx, bot);
     },
@@ -816,12 +813,12 @@ ${contentText}${imageText}`, session);
     handler: async (_args, ctx) => {
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
-      
+
       if (globalBots.length === 0) {
         ctx.ui.notify("暂无配置的机器人", "warning");
         return;
       }
-      
+
       const name = await ctx.ui.input("输入要删除的BotID或名称", "");
       if (!name) return;
 
@@ -832,14 +829,14 @@ ${contentText}${imageText}`, session);
       }
 
       const removed = globalBots.splice(idx, 1)[0];
-      
+
       await saveGlobalConfig({ bots: globalBots });
-      
+
       if (sessionCfg.activeBotId === removed.botId) {
         disconnect();
         sessionCfg.activeBotId = globalBots[0]?.botId;
         await saveSessionConfig(sessionCfg);
-        
+
         if (globalBots.length > 0) {
           ctx.ui.notify(`✅ 已删除 ${removed.name || removed.botId}，自动切换到下一个`, "info");
           const nextBot = getActiveBot(globalBots, sessionCfg.activeBotId);
@@ -859,7 +856,7 @@ ${contentText}${imageText}`, session);
     handler: async (_args, ctx) => {
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
-      
+
       const active = getActiveBot(globalBots, sessionCfg.activeBotId);
       if (!active) {
         ctx.ui.notify(
@@ -869,10 +866,10 @@ ${contentText}${imageText}`, session);
         );
         return;
       }
-      
+
       let statusIcon: string;
       let statusText: string;
-      
+
       if (!sessionCfg.enabled) {
         statusIcon = "🔴";
         statusText = "已禁用";
@@ -883,7 +880,7 @@ ${contentText}${imageText}`, session);
         statusIcon = "❌";
         statusText = "已断开";
       }
-      
+
       ctx.ui.notify(
         `${statusIcon} ${active.name || active.botId}
 状态: ${statusText}
@@ -905,7 +902,7 @@ ${contentText}${imageText}`, session);
       }
       sessionCfg.enabled = true;
       await saveSessionConfig(sessionCfg);
-      
+
       const bot = getActiveBot(globalBots, sessionCfg.activeBotId);
       if (bot) {
         await connect(ctx, bot);
@@ -942,7 +939,7 @@ ${contentText}${imageText}`, session);
         return;
       }
       const active = getActiveBot(globalBots, sessionCfg.activeBotId);
-      const sessionList = Array.from(sessions.entries()).map(([reqId, s]) => 
+      const sessionList = Array.from(sessions.entries()).map(([reqId, s]) =>
         `[${active?.name || s.botId}]
   reqId: ${reqId}
   userId: ${s.userId}
@@ -984,12 +981,12 @@ ${sessionList}`, "info");
       // 加载全局机器人列表
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
-      
+
       // 加载本会话配置
       sessionCfg = await loadSessionConfig();
-      
+
       await mkdir(TEMP, { recursive: true });
-      
+
       // 如果启用了且选择了机器人，则尝试连接（失败不影响 pi）
       if (sessionCfg.enabled && sessionCfg.activeBotId) {
         const bot = getBotById(globalBots, sessionCfg.activeBotId);
@@ -1007,9 +1004,9 @@ ${sessionList}`, "info");
     }
   });
 
-  pi.on("session_shutdown", () => { 
+  pi.on("session_shutdown", () => {
     try {
-      disconnect(); 
+      disconnect();
     } catch (err) {
       console.error(`[wecombot] session_shutdown 异常:`, err);
     }
@@ -1021,14 +1018,14 @@ ${sessionList}`, "info");
 
   pi.on("agent_end", async (e, ctx) => {
     setStatus(ctx);
-    
+
     // 检查当前是否有正在处理的消息
     if (!currentReqId || pendingMessages.length === 0) return;
-    
+
     // 确认是当前请求的回复
     const pending = pendingMessages[0];
     if (pending.reqId !== currentReqId) return;
-    
+
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) {
       // 没有回复内容，移除消息并继续处理下一条
@@ -1038,7 +1035,7 @@ ${sessionList}`, "info");
       processMessageQueue();
       return;
     }
-    
+
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) {
       clearProgressNotifier(currentReqId);
@@ -1047,24 +1044,24 @@ ${sessionList}`, "info");
       processMessageQueue();
       return;
     }
-    
+
     const active = getActiveBot(globalBots, sessionCfg.activeBotId);
     const pattern = new RegExp(`\\[wecombot\\] \\[${active?.name || active?.botId || ""}\\] \\[([^\\]]+)\\]\\n?`, "g");
     const replyContent = txt.replace(pattern, "");
-    
+
     // 回复给对应的用户
     if (replyContent.trim()) {
       replyTo(pending.reqId, replyContent, true);
 
     }
-    
+
     // 【增强】清理进度通知定时器
     clearProgressNotifier(currentReqId);
-    
+
     // 移除已处理的消息
     pendingMessages.shift();
     currentReqId = null;
-    
+
     // 处理下一条消息
     processMessageQueue();
   });
