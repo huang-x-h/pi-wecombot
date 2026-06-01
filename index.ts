@@ -376,23 +376,33 @@ export default function (pi: ExtensionAPI) {
   }, 60000);
 
   // Status - 已连接后才显示，未连接时不显示
-  function setStatus(ctx: ExtensionContext, msg?: string) {
-    const active = getActiveBot(globalBots, sessionCfg.activeBotId);
+  function setStatus(ctx: ExtensionContext | null, msg?: string) {
+    // ctx 可能已失效（session 已替换），捕获此错误避免崩溃
+    try {
+      const active = getActiveBot(globalBots, sessionCfg.activeBotId);
 
-    // 已连接才显示状态栏
-    if (!connected) {
-      ctx.ui.setStatus("wecombot", "");
-      return;
-    }
+      // 已连接才显示状态栏
+      if (!connected || !ctx) {
+        ctx?.ui.setStatus("wecombot", "");
+        return;
+      }
 
-    const botName = active?.name || active?.botId.slice(0, 8) || "企微";
+      const botName = active?.name || active?.botId.slice(0, 8) || "企微";
 
-    if (msg) {
-      // 有错误信息时显示
-      ctx.ui.setStatus("wecombot", `${botName}【wecom】🔴 ${msg}`);
-    } else {
-      // 已连接
-      ctx.ui.setStatus("wecombot", `${botName}【wecom】✅ ${sessions.size}`);
+      if (msg) {
+        // 有错误信息时显示
+        ctx.ui.setStatus("wecombot", `${botName}【wecom】🔴 ${msg}`);
+      } else {
+        // 已连接
+        ctx.ui.setStatus("wecombot", `${botName}【wecom】✅ ${sessions.size}`);
+      }
+    } catch (err: any) {
+      // 忽略 ctx 已失效错误（正常现象，session 替换时旧回调会触发）
+      if (err?.message?.includes("stale")) {
+        console.log("[wecombot] setStatus: ctx 已失效，忽略");
+        return;
+      }
+      throw err;
     }
   }
 
@@ -430,13 +440,13 @@ export default function (pi: ExtensionAPI) {
       ws.on("connected", () => {
         console.log(`[wecombot] ✅ ${bot.name || bot.botId} 已连接`);
         connected = true;
-        setStatus(ctx);
+        setStatus(currentCtx);
       });
 
       ws.on("authenticated", () => {
         console.log(`[wecombot] ✅ ${bot.name || bot.botId} 认证成功`);
         connected = true;
-        setStatus(ctx);
+        setStatus(currentCtx);
         if (!toolsRegistered) {
           registerTools();
           toolsRegistered = true;
@@ -623,10 +633,12 @@ ${contentText}${imageText}`, session);
 
         console.log(`[wecombot] ❌ ${bot.name || bot.botId} ${disconnectMsg}${reason ? `: ${reason}` : ""}`);
 
+        // 使用 currentCtx 而不是捕获的 ctx，避免 session 替换后 ctx 已失效
+        const activeCtx = currentCtx;
         if (wasConnected && isKicked) {
-          setStatus(ctx, `被其他会话连接 (${SESSION_ID.slice(0, 4)})`);
+          setStatus(activeCtx, `被其他会话连接 (${SESSION_ID.slice(0, 4)})`);
         } else {
-          setStatus(ctx);
+          setStatus(activeCtx);
         }
       });
 
@@ -635,11 +647,17 @@ ${contentText}${imageText}`, session);
         console.log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
         connected = false;
 
+        // 使用 currentCtx 而不是捕获的 ctx，避免 session 替换后 ctx 已失效
+        const activeCtx = currentCtx;
         if (errMsg.includes("already connected") || errMsg.includes("connection refused")) {
-          setStatus(ctx, "连接被占用");
-          ctx.ui.notify(`❌ ${bot.name || bot.botId} 连接失败：该机器人已在其他会话连接`, "error");
+          setStatus(activeCtx, "连接被占用");
+          try {
+            activeCtx?.ui.notify(`❌ ${bot.name || bot.botId} 连接失败：该机器人已在其他会话连接`, "error");
+          } catch (e: any) {
+            if (!e?.message?.includes("stale")) throw e;
+          }
         } else {
-          setStatus(ctx, errMsg);
+          setStatus(activeCtx, errMsg);
         }
       });
 
