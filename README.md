@@ -298,8 +298,16 @@ Session A (已连接工作助手)     Session B
 | 类型 | 路径 | 内容 | 共享方式 |
 |------|------|------|---------|
 | **全局配置** | `~/.pi/agent/wecom-bot.json` | 机器人列表 (botId, secret, name) | **所有会话共享** |
-| **会话配置** | `~/.pi/agent/wecom-bot-session-{id}.json` | activeBotId, enabled | **仅本会话** |
-| **临时文件** | `~/.pi/agent/tmp/wecom-bot/{id}/` | 上传文件等 | **仅本会话** |
+| **会话配置** | `~/.pi/agent/wecom-bot-session-{pi会话ID}.json` | activeBotId, enabled | **仅本会话** |
+| **临时文件** | `~/.pi/agent/tmp/wecom-bot/{pi会话ID}/` | 上传文件等 | **仅本会话** |
+
+> **会话身份说明**：会话配置键使用 pi 的会话 ID（`ctx.sessionManager.getSessionId()`），
+> 同一会话文件跨重启/reload/resume 保持稳定，机器人可自动重连；
+> 同目录新开其他会话因会话 ID 不同不会读取该配置，不会抢占连接。
+> 可用 `PI_SESSION_ID`/`PI_INSTANCE_ID` 环境变量显式覆盖。
+> 
+> ⚠️ **从 v1.1.x 及更早版本升级**：旧版本会话配置文件以随机 ID 命名，
+> 升级后不再匹配，需在入口会话重新执行一次 `/wecombot-use`。
 
 ## 工作原理
 

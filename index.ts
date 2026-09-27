@@ -66,13 +66,14 @@ interface Session {
 // Session Utils
 // ============================================================================
 
-// 获取会话唯一标识 - 使用环境变量或生成唯一ID
-function getSessionId(): string {
-  // 优先使用 pi 提供的环境变量
+// 解析会话唯一标识：env 显式覆盖 > pi 会话 ID（跨重启稳定）> 随机兜底
+// 注：纯随机 ID 会导致会话重启后读不到旧配置，机器人无法自动重连
+function resolveSessionId(ctx?: ExtensionContext): string {
   if (process.env.PI_SESSION_ID) return process.env.PI_SESSION_ID;
   if (process.env.PI_INSTANCE_ID) return process.env.PI_INSTANCE_ID;
-
-  // 备用：使用时间戳+随机数，确保唯一性
+  try {
+    if (ctx?.sessionManager?.getSessionId) return ctx.sessionManager.getSessionId();
+  } catch { /* fallthrough */ }
   const timestamp = Date.now().toString(36);
   const random = Math.random().toString(36).substring(2, 6);
   return `sess-${timestamp}-${random}`;
@@ -154,15 +155,10 @@ function getBotById(bots: BotConfig[], botId: string): BotConfig | undefined {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-  // 初始化路径
-  SESSION_ID = getSessionId();
+  // 初始化路径（会话身份依赖 ctx，延迟到 session_start 解析）
   GLOBAL_CONFIG = getGlobalConfigPath();
-  SESSION_CONFIG = getSessionConfigPath(SESSION_ID);
-  TEMP = getSessionTempPath(SESSION_ID);
 
-  console.log(`[wecombot] 会话ID: ${SESSION_ID.slice(0, 8)}`);
   console.log(`[wecombot] 全局配置: ${GLOBAL_CONFIG}`);
-  console.log(`[wecombot] 会话配置: ${SESSION_CONFIG}`);
 
   // 全局机器人列表（从全局配置加载）
   let globalBots: BotConfig[] = [];
@@ -996,6 +992,14 @@ ${sessionList}`, "info");
     try {
       // 保存当前会话的 ctx，供 WebSocket 回调使用
       currentCtx = ctx;
+
+      // 解析稳定会话身份（此处才有 ctx），初始化会话级路径
+      SESSION_ID = resolveSessionId(ctx);
+      SESSION_CONFIG = getSessionConfigPath(SESSION_ID);
+      TEMP = getSessionTempPath(SESSION_ID);
+      console.log(`[wecombot] 会话ID: ${SESSION_ID.slice(0, 8)}`);
+      console.log(`[wecombot] 会话配置: ${SESSION_CONFIG}`);
+
       // 加载全局机器人列表
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
